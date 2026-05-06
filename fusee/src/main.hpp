@@ -1,3 +1,4 @@
+#pragma GCC diagnostic ignored "-Wignored-attributes"
 #pragma once
 
 #include <chrono>
