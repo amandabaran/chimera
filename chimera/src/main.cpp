@@ -129,74 +129,73 @@ int main(int argc, char **argv) {
     ctrl::ControlBlock cb(resolved_port);
     cb.registerPd("primary");
 
-    // Allocate memory replica space
-    size_t allocated_size = num_registers * sizeof(Register) + 1024; // Base buffer + headroom
-    cb.allocateBuffer("shared-buf", allocated_size, 64);
-
-    cb.registerMr(
-        "shared-mr", "primary", "shared-buf",
-        ctrl::ControlBlock::LOCAL_READ | ctrl::ControlBlock::LOCAL_WRITE |
-        ctrl::ControlBlock::REMOTE_READ | ctrl::ControlBlock::REMOTE_WRITE |
-        ctrl::ControlBlock::REMOTE_ATOMIC);
-
-    std::vector<ProcId> remote_ids;
-    for (ProcId id = 1; id <= num_proc; id++) {
-        if (id != proc_id) remote_ids.push_back(id);
-    }
-
-    for (auto const& id : remote_ids) {
-        cb.registerCq(fmt::format("cq{}", id));
-    }
-
-    // 4. Connect over Memstore
     auto& store = memstore::MemoryStore::getInstance();
-    RcConnectionExchanger<ProcId> ce(proc_id, remote_ids, cb);
-    
-    for (auto const& id : remote_ids) {
-        auto cq = fmt::format("cq{}", id);
-        ce.configure(id, "primary", "shared-mr", cq, cq);
-    }
 
-    ce.announceAll(store, "qp");
-    ce.announceReady(store, "qp", "prepared");
-    ce.waitReadyAll(store, "qp", "prepared");
-    ce.unannounceReady(store, "qp", "finished");
-
-    ce.connectAll(
-        store, "qp",
-        ctrl::ControlBlock::LOCAL_READ | ctrl::ControlBlock::LOCAL_WRITE |
-        ctrl::ControlBlock::REMOTE_READ | ctrl::ControlBlock::REMOTE_WRITE |
-        ctrl::ControlBlock::REMOTE_ATOMIC);
-
-    ce.announceReady(store, "qp", "connected");
-    ce.waitReadyAll(store, "qp", "connected");
-
-    // 5. Workload Execution
     if (is_client) {
-        std::cout << "Node " << proc_id << " initializing Chimera Client via Dory." << std::endl;
+        // CLIENT SETUP
+        std::cout << "Configuring Client " << proc_id << std::endl;
+
+        // 1. Local scratchpad (Private result area)
+        // We only need enough space for 1 cache line (64 bytes) per server connection
+        size_t scratch_size = num_servers * 64; 
+        cb.allocateBuffer("scratch-buf", scratch_size, 64);
+        cb.registerMr("scratch-mr", "primary", "scratch-buf", 
+                    ctrl::ControlBlock::LOCAL_READ | ctrl::ControlBlock::LOCAL_WRITE);
+
+    
+        // 2. Identify Servers (Clients connect to all servers)
+        std::vector<ProcId> server_ids;
+        for (ProcId id = 1; id <= num_servers; id++) server_ids.push_back(id);
+
+        for (auto const& id : server_ids) cb.registerCq(fmt::format("cq{}", id));
+
+        RcConnectionExchanger<ProcId> ce(proc_id, server_ids, cb);
+        for (auto const& id : server_ids) {
+            // Note: "shared-mr" here refers to the MR name ON THE SERVER
+            ce.configure(id, "primary", "shared-mr", fmt::format("cq{}", id), fmt::format("cq{}", id));
+        }
+
+        // 3. Handshake & Connect
+        ce.announceAll(store, "qp");
+        ce.announceReady(store, "qp", "prepared");
+        ce.waitReadyAll(store, "qp", "prepared");
+        ce.connectAll(store, "qp", ctrl::ControlBlock::LOCAL_READ | ctrl::ControlBlock::LOCAL_WRITE); 
+        ce.announceReady(store, "qp", "connected");
+        ce.waitReadyAll(store, "qp", "connected");
         
-        // Fetch replicas addresses from memstore (replacing Remus Registry)
-        std::vector<uint64_t> all_replicas(num_servers);
-        for(ProcId s_id = 1; s_id <= num_servers; s_id++) {
+        // Prepare the vector of ReplicaConn for the Client
+        std::vector<chimera::AsyncCasAbdClient::ReplicaConn> chimera_conns;
+
+        for (ProcId s_id = 1; s_id <= num_servers; s_id++) {
+            // 1. Get the remote virtual address from Memstore
             std::string key = fmt::format("replica_addr_{}", s_id);
             std::string addr_str;
-            store.get(key, addr_str);
-            all_replicas[s_id - 1] = std::stoull(addr_str);
+            while(!store.get(key, addr_str)) { /* busy wait for server to post addr */ }
+            uintptr_t remote_addr = std::stoull(addr_str);
+
+            // 2. Get the established connection from the Exchanger
+            // Dory's connectAll populates the connections mapped by ProcId
+            auto& conn = ce.getConnection(s_id);
+
+            chimera_conns.push_back({&conn, remote_addr});
         }
 
         ChimeraMetrics node_metrics;
         std::chrono::high_resolution_clock::time_point start_time, end_time;
 
-        // Note: Dory relies on async multiplexing inside the client implementation 
-        // rather than spawning 16 pthreads. Adjust ClientFactory accordingly.
-        auto client = ClientFactory::create(
-            backend, proc_id, cb, all_replicas,
-            num_registers, &node_metrics
+        // Pass the Dory ControlBlock and the packaged connections
+        auto client = std::make_unique<chimera::AsyncCasAbdClient>(
+            static_cast<uint16_t>(proc_id), 
+            cb, 
+            chimera_conns,
+            num_registers, 
+            &node_metrics
         );
 
         ce.announceReady(store, "qp", "initialized");
         ce.waitReadyAll(store, "qp", "initialized");
 
+        // Workload execution (pipelined, non-blocking)
         run_workload(client.get(), 0, proc_id, num_registers, rq_p, get_p, node_metrics, start_time, end_time);
 
         // Finalize
@@ -206,26 +205,58 @@ int main(int argc, char **argv) {
         ce.announceReady(store, "qp", "finished");
         ce.waitReadyAll(store, "qp", "finished");
         ce.unannounceReady(store, "qp", "initialized");
+        ce.unannounceReady(store, "qp", "finished");
+        ce.unannounceReady(store, "qp", "connected");
+        ce.unannounceAll(store, "qp");
+        ce.unannounceReady(store, "qp", "prepared");
 
     } else {
-        // Memory Node Logic
-        std::cout << "Node " << proc_id << " acting as Memory Server." << std::endl;
-        
-        // Announce buffer address to Memstore
-        uintptr_t local_addr = cb.mr("shared-mr").addr;
-        store.set(fmt::format("replica_addr_{}", proc_id), std::to_string(local_addr));
+        // REPLICA (SERVER) SETUP
+        // 1. Setup shared registers
+        size_t server_buf_size = num_registers * sizeof(Register);
+        cb.allocateBuffer("shared-buf", server_buf_size, 64);
+        cb.registerMr("shared-mr", "primary", "shared-buf",
+            ctrl::ControlBlock::LOCAL_READ | ctrl::ControlBlock::LOCAL_WRITE |
+            ctrl::ControlBlock::REMOTE_READ | ctrl::ControlBlock::REMOTE_WRITE |
+            ctrl::ControlBlock::REMOTE_ATOMIC);
+            
+        memset(reinterpret_cast<void*>(cb.mr("shared-mr").addr), 0, server_buf_size);
+        store.set(fmt::format("replica_addr_{}", proc_id), std::to_string(cb.mr("shared-mr").addr));
 
-        ce.announceReady(store, "qp", "initialized");
-        ce.announceReady(store, "qp", "finished");
+        // 2. Identify Clients (Servers connect to all clients)
+        std::vector<ProcId> client_ids;
+        for (ProcId id = num_servers + 1; id <= num_proc; id++) client_ids.push_back(id);
+
+        for (auto const& id : client_ids) cb.registerCq(fmt::format("cq{}", id));
+
+        RcConnectionExchanger<ProcId> ce(proc_id, client_ids, cb);
+        for (auto const& id : client_ids) {
+            // Servers don't really need a remote MR from clients for ABD
+            ce.configure(id, "primary", "scratch-mr", fmt::format("cq{}", id), fmt::format("cq{}", id));
+        }
+
+        // 3. Handshake & Connect
+        ce.announceAll(store, "qp");
+        ce.announceReady(store, "qp", "prepared");
+        ce.waitReadyAll(store, "qp", "prepared");
+        ce.connectAll(store, "qp", ctrl::ControlBlock::LOCAL_READ | ctrl::ControlBlock::LOCAL_WRITE);
+        ce.announceReady(store, "qp", "connected");
+        ce.waitReadyAll(store, "qp", "connected");
+
+        std::cout << "Server " << proc_id << " online." << std::endl;
         ce.waitReadyAll(store, "qp", "finished");
+
+        // FIX: Moved cleanup inside the server block
+        ce.announceReady(store, "qp", "finished"); // Echo finish so clients can exit safely
         ce.unannounceReady(store, "qp", "initialized");
+        ce.unannounceReady(store, "qp", "finished");
+        ce.unannounceReady(store, "qp", "connected");
+        ce.unannounceAll(store, "qp");
+        ce.unannounceReady(store, "qp", "prepared");
+
     }
 
-    // Clean up
-    ce.unannounceReady(store, "qp", "connected");
-    ce.unannounceAll(store, "qp");
-    ce.unannounceReady(store, "qp", "prepared");
-
+    
     std::cout << "Experiment Complete!" << std::endl;
     return 0;
 }

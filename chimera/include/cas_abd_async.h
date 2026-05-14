@@ -34,14 +34,20 @@ private:
     uint8_t client_id_;
     ChimeraMetrics* metrics_;
     std::vector<size_t> quorum_indices_;
-    std::vector<PaddedRegister*> replica_scratchpads_; // Still needs to be inside the registered MR
+    std::vector<Register*> replica_scratchpads_; // For CAS and single reads (High speed, no false sharing)
+    std::vector<Register*> bulk_scratchpads_; // For Bulk Reads/Range Queries (Packed for iteration)
+    uint64_t max_range_len_;
+    uint64_t primary_key_; // For fast_put optimization
+    Register last_reg_; // For fast_put optimization
 
     // Internal Dory completion polling
     static thread_local std::vector<struct ibv_wc> wces;
     
     static constexpr size_t MAX_REPLICAS = 7;
+    static constexpr size_t PER_CLIENT_MEM_SIZE = 4096; // For CAS and bulk ops
 
 #if CHIMERA_CACHE_ENABLED
+    Cache cache_;
     static const size_t FETCH_COUNT = 8;  // Runtime decision
     
 #else
@@ -114,7 +120,7 @@ private:
     }
 
     void update_quorum_parallel(uint64_t key, const uint64_t* observed_expected, 
-                                Register target) {
+                            Register target) {
         uint64_t success_count = 0;
         std::vector<size_t> active_indices;
         uint64_t expected[MAX_REPLICAS];
@@ -125,21 +131,25 @@ private:
         }
 
         while (success_count < quorum_ && !active_indices.empty()) {
-            int cas_pending = 0; // Fix: variable name consistency
+            int cas_pending = 0;
             std::vector<size_t> active_replicas;
             
             for (size_t i : active_indices) {
                 size_t r = quorum_indices_[i];
                 active_replicas.push_back(r);
                 
+                // 1. Calculate the actual remote address for this key
+                uintptr_t remote_addr = replica_conns_[r].remote_buf_addr + (key * sizeof(Register));
+                
+                // 2. Pass the RAW uint64_t values for expected and target
                 replica_conns_[r].rc->postCas(
                     0, 
-                    reinterpret_cast<void*>(&replica_scratchpads_[r][0]), 
-                    replica_conns_[r].remote_buf_addr + (key * sizeof(Register)), // Use Register size
-                    expected[i], 
-                    target.raw
+                    reinterpret_cast<void*>(replica_scratchpads_[r]), 
+                    remote_addr, 
+                    expected[i], // Must be the specific uint64_t for this replica
+                    target.raw   // Must be the raw uint64_t value
                 );
-                cas_pending++; // Fix: match the variable above
+                cas_pending++;
                 count_cas_attempt();
             }
             
@@ -149,7 +159,9 @@ private:
             while (it != active_indices.end()) {
                 size_t i = *it;
                 size_t r = quorum_indices_[i];
-                Register observed(replica_scratchpads_[r][0].raw);
+                
+                // 3. DEREFERENCE the pointer to get the value the NIC just wrote
+                Register observed = *replica_scratchpads_[r]; 
                 
                 if (observed.raw == expected[i]) {
                     success_count++;
@@ -157,7 +169,7 @@ private:
                     if (success_count >= quorum_) break;
                 } else {
                     count_cas_fail();
-                    expected[i] = observed.raw;
+                    expected[i] = observed.raw; // Update expected for the next retry
                     ++it;
                 }
             }
@@ -165,22 +177,26 @@ private:
     }
     
     bool update_quorum_speculative(uint64_t key, Register expected_reg, 
-                                   Register target_reg, uint64_t* next_expected, 
-                                   Register& next_target_reg) {
+                               Register target_reg, uint64_t* next_expected, 
+                               Register& next_target_reg) {
         int pending = 0;
         std::vector<size_t> active_replicas;
         
         for (size_t i = 0; i < quorum_; ++i) {
             size_t r = quorum_indices_[i];
             active_replicas.push_back(r);
-            auto &rc = replica_conns_[r];
+            
+            // 1. Calculate the actual remote address
+            uintptr_t remote_addr = replica_conns_[r].remote_buf_addr + (key * sizeof(Register));
 
+            // 2. Fix: Use expected_reg.raw and target_reg.raw
+            // 3. Fix: Pass replica_scratchpads_[r] (the pointer) without the extra '&'
             replica_conns_[r].rc->postCas(
-                0, // wr_id
-                reinterpret_cast<void*>(&replica_scratchpads_[r][0]), // Local addr to store result
-                replica_conns_[r].remote_buf_addr + (key * sizeof(Register)), // Remote addr
-                expected[i], // Compare value
-                target.raw   // Swap value
+                0, 
+                reinterpret_cast<void*>(replica_scratchpads_[r]), 
+                remote_addr, 
+                expected_reg.raw, // Use the argument passed to the function
+                target_reg.raw    // Use the argument passed to the function
             );
             pending++;
             count_cas_attempt();
@@ -193,7 +209,9 @@ private:
         
         for (size_t i = 0; i < quorum_; ++i) {
             size_t r = quorum_indices_[i];
-            Register observed(replica_scratchpads_[r][0].raw);
+            
+            // 4. Fix: Dereference the scratchpad pointer to get the value
+            Register observed = *replica_scratchpads_[r];
             
             if (observed.raw == expected_reg.raw) {
                 success_count++;
@@ -212,6 +230,7 @@ private:
         }
         
         count_speculation_fail();
+        // Use target_reg.fields.value to maintain the value being written
         next_target_reg = Register(z_max + 1, client_id_, target_reg.fields.value);
         return false;
     }
@@ -241,14 +260,19 @@ public:
             quorum_indices_.push_back((client_id_ + i) % replica_conns_.size());
         }
         // Setup scratchpads within the registered Dory buffer
-        // Assuming your main.cpp registered a MR named "shared-mr"
-        uint8_t* base_ptr = reinterpret_cast<uint8_t*>(cb_.mr("shared-mr").addr);
-        
+        size_t per_client_offset = client_id_ * PER_CLIENT_MEM_SIZE; 
+        uint8_t* base_ptr = reinterpret_cast<uint8_t*>(cb_.mr("scratch-mr").addr) + per_client_offset;
         for (size_t i = 0; i < replica_conns_.size(); ++i) {
-            // Ensure 64-byte alignment for performance
-            uintptr_t offset = i * 512; // Sufficient spacing for FETCH_COUNT
+            // 1. Give each replica 64 bytes of "private" space for CAS
             replica_scratchpads_.push_back(
-                reinterpret_cast<Register*>(base_ptr + offset)
+                reinterpret_cast<Register*>(base_ptr + (i * 64))
+            );
+
+            // 2. Give each replica a larger, PACKED space for bulk ops
+            // This starts after all the CAS scratchpads
+            uintptr_t bulk_start = replica_conns_.size() * 64; 
+            bulk_scratchpads_.push_back(
+                reinterpret_cast<Register*>(base_ptr + bulk_start + (i * max_range_len_ * sizeof(Register)))
             );
         }
         
@@ -341,7 +365,7 @@ public:
             replica_conns_[r].rc->postSendSingle(
                 dory::conn::ReliableConnection::RdmaRead, 
                 0, // wr_id (can be used to track specific ops)
-                reinterpret_cast<void*>(&replica_scratchpads_[r][0]), // Local addr
+                reinterpret_cast<void*>(&bulk_scratchpads_[r][0]), // Local addr
                 bytes,                                     // Length
                 replica_conns_[r].remote_buf_addr + (key * sizeof(Register)) // Remote addr
             );
@@ -361,7 +385,7 @@ public:
 
             for (size_t k = 0; k < quorum_; ++k) {
                 size_t r = quorum_indices_[k];
-                Register reg = replica_scratchpads_[r][i];
+                Register reg = bulk_scratchpads_[r][i];
                 count_read();
                 
                 if (max_reg_for_idx < reg) {
@@ -381,7 +405,7 @@ public:
                     requested_key_count = max_count_for_idx;
                     for (size_t k = 0; k < quorum_; ++k) {
                         size_t r = quorum_indices_[k];
-                        req_expected[k] = replica_scratchpads_[r][i].raw;
+                        req_expected[k] = bulk_scratchpads_[r][i].raw;
                     }
                 }
             }
@@ -529,9 +553,9 @@ public:
             replica_conns_[r].rc->postSendSingle(
                 dory::conn::ReliableConnection::RdmaRead, 
                 0, // wr_id (can be used to track specific ops)
-                reinterpret_cast<void*>(&replica_scratchpads_[r][0]), // Local addr
+                reinterpret_cast<void*>(&bulk_scratchpads_[r][0]), // Local addr
                 bytes,                                     // Length
-                replica_conns_[r].remote_buf_addr + (key * sizeof(Register)) // Remote addr
+                replica_conns_[r].remote_buf_addr + (start_key * sizeof(Register)) // Remote addr
             );
             pending++;
         }
@@ -546,7 +570,7 @@ public:
         for (size_t i = 0; i < range_len; ++i) {
             for (size_t k = 0; k < quorum_; ++k) {
                 size_t r = quorum_indices_[k];
-                Register reg = replica_scratchpads_[r][i];
+                Register reg = bulk_scratchpads_[r][i];
                 count_read();
                 
                 if (max_registers[i] < reg) {
@@ -568,7 +592,7 @@ public:
             //     uint64_t expected[MAX_REPLICAS];
             //     for (size_t k = 0; k < quorum_; ++k) {
             //         size_t r = quorum_indices_[k];
-            //         expected[k] = replica_scratchpads_[r][i].raw;
+            //         expected[k] = bulk_scratchpads_[r][i].raw;
             //     }
             //     update_quorum_parallel(start_key + i, expected, max_registers[i]);
             // }
