@@ -16,6 +16,31 @@ const uint64_t default_warmup = 1'000'000;
 const uint64_t default_iter_count = 1'000'000;
 const uint64_t default_keepwarm = 500'000;
 
+enum class OpType { READ, UPDATE, SCAN };
+
+struct KvsOp {
+  OpType type;
+  std::string key;
+  std::string value; // Used for UPDATE
+  int scan_count;    // Used for SCAN
+};
+
+inline std::string IncrementYcsbKey(const std::string& key) {
+    size_t non_digit = key.find_first_of("0123456789");
+    if (non_digit == std::string::npos) return key + "0"; 
+    
+    std::string prefix = key.substr(0, non_digit);
+    long long num = std::stoll(key.substr(non_digit));
+    num++;
+    
+    std::string num_str = std::to_string(num);
+    int padding_needed = static_cast<int>(key.length() - prefix.length() - num_str.length());
+    if (padding_needed > 0) {
+        return prefix + std::string(padding_needed, '0') + num_str;
+    }
+    return prefix + num_str;
+}
+
 int main(int argc, char* argv[]) {
   Layout layout;
   layout.num_clients = 1;
@@ -282,7 +307,7 @@ int main(int argc, char* argv[]) {
     }
 
     std::cout << "Querying YCSB for the list of operations... " << std::flush;
-    std::vector<std::pair<std::string, std::optional<std::string>>> operations = {};
+    std::vector<KvsOp> operations = {};
 
     {
       auto output = exec(ycsb_path + " run basic -P " + workload + " -s 2> /dev/null");
@@ -293,7 +318,7 @@ int main(int argc, char* argv[]) {
           auto keyend = line.find(" [", keystart);
           auto key = line.substr(keystart, keyend - keystart);
 
-          operations.emplace_back(key, std::optional<std::string>());
+          operations.push_back({OpType::READ, key, "", 0});
         } else if (!(std::strncmp("UPDATE ", line.c_str(), std::string("UPDATE ").length()))) {
           auto keystart = std::string("UPDATE usertable ").length();
           auto keyend = line.find(" [", keystart);
@@ -303,28 +328,22 @@ int main(int argc, char* argv[]) {
           auto end = line.length() - std::string(" ]").length();
           auto value = line.substr(start, end - start);
 
-          operations.emplace_back(key, std::optional<std::string>(value));
+          operations.push_back({OpType::UPDATE, key, value, 0});
+        } else if (!(std::strncmp("SCAN ", line.c_str(), std::string("SCAN ").length()))) {
+          auto keystart = std::string("SCAN usertable ").length();
+          auto keyend = line.find(" ", keystart);
+          auto key = line.substr(keystart, keyend - keystart);
+          
+          auto countstart = keyend + 1;
+          auto countend = line.find(" [", countstart);
+          int count = std::stoi(line.substr(countstart, countend - countstart));
 
-        } else {
-          continue;
+          operations.push_back({OpType::SCAN, key, "", count});
         }
-
-        // std::cout << line << std::endl;
-        // std::cout << operations.back().first << ": ";
-        // if (operations.back().second.has_value()) {
-        //   std::cout << "UDPATE " << operations.back().second.value()
-        //             << " (" << operations.back().second.value().length()
-        //             << ", " << (line.length() - operations.back().first.length() - std::string("UPDATE usertable  [ field0= ]").length()) << ")";
-        // } else { std::cout << "READ"; }
-        // std::cout << std::endl;
-
-        // if (operations.size() >= 10) {
-        //   throw std::runtime_error("Only 10 operations for now");
-        // }
       }
     }
-
     std::cout << "Done." << std::endl;
+
     // std::cout << "Waiting for the initialization of other clients... " << std::flush;
 
     ce.announceReady(store, "qp", "initialized");
@@ -349,196 +368,50 @@ int main(int argc, char* argv[]) {
     int32_t total_cache_hit_count = 0;
     int32_t total_true_cache_hit_count = 0;
 
+    // Worklaod Loop
+    // WORKLOAD LOOP
     for (size_t i = 0; i < total_iter_count; i++) {
       if (i == start_measurements) {
-        start = now;
+        start = std::chrono::steady_clock::now();
       } else if (i == stop_measurements) {
-        end = now;
+        end = std::chrono::steady_clock::now();
       }
       
       auto operation = operations[i % operations.size()];
 
-      // std::cout << operation.first << ": ";
-      // if (operation.second.has_value()) {
-      //   std::cout << "UDPATE " << operation.second.value()
-      //             << " (" << operation.second.value().length() << ")";
-      // } else { std::cout << "READ"; }
-      // std::cout << std::endl;
+      // Native point operation processing lambda for FUSEE
+      // Native point operation processing lambda for FUSEE
+      auto execute_point_op = [&](const std::string& target_key, OpType type, const std::string& target_value) {
+        auto hkey = hash(target_key);
+        auto random_server = (reinterpret_cast<uint64_t const*>(hkey.data())[0] % (layout.num_servers - 1)) + 1;
+        auto main_server = 0UL;
+        auto& main_index = *(indexes.at(main_server));
 
-      auto true_key = operation.first;
-      auto hkey = hash(true_key);
-      auto random_server = (reinterpret_cast<uint64_t const*>(hkey.data())[0] % (layout.num_servers - 1)) + 1;
-      auto main_server = 0UL;
-      auto& main_index = *(indexes.at(main_server));
-
-      auto search = main_index.search(hkey);
-      uint64_t new_kv_id;
-      
-      auto cache_entry = pointer_cache.get(hkey);
-      if (cache_entry) {
-        auto kv_id = *cache_entry;
-        now = std::chrono::steady_clock::now();
-        auto search_time = now - last_time;
-        if (start_measurements <= i && i < stop_measurements) {
-          total_cache_hit_count += 1;
-        }
-
-        if (operation.second.has_value()) {
-          auto value = operation.second.value();
-
-          // Phase 1 : Write KV and read index
-
-          auto* local_log = client.prepareToWriteEntry(true_key, value);
-          new_kv_id = client.readAndWrite(local_log, kv_id, random_server).second;
-          auto matches = search.await();
-          
-          auto prev_entry = search.entryFor(kv_id);
-          auto offset = search.getOffsetOf(prev_entry);
-          if (!offset.has_value()) {
-            // Index was updated
-            goto cache_miss_or_fake_hit;
-          }
-
-          futures.clear();
-          // Phase 2: Update backup indexes
-          for (size_t s = 1; s < layout.num_servers; s++) {
-            auto& index = *(indexes.at((main_server + s) % layout.num_servers));
-            futures.emplace_back(index.tryUpdate(*offset, prev_entry, hkey, new_kv_id));
-          }
-
-          auto res = futures.at(0).await();
-
-          if (res.asUint64() != prev_entry.asUint64()) {
-            // Lost the game, letting the other finish.
-            auto iter = 0;
-            do {
-              res = main_index.tryCheck(*offset).await();
-              if(iter++ == 1000) {
-                fmt::print("Concurrent update from other client (ts: {}), waiting for the update to finish.\r", prev_entry.asUint64());
-              }
-            } while(res.asUint64() == prev_entry.asUint64());
-            new_kv_id = res.getValue();
-            goto cache_hit_update_finish;
-          }
-
-          for (size_t s = 2; s < layout.num_servers; s++) {
-            res = futures.at(s - 1).await();
-
-            if (res.asUint64() != prev_entry.asUint64()) {
-              // Won the game, erasing the other value.
-              auto& index =
-                  *(indexes.at((main_server + s) % layout.num_servers));
-              auto new_res =
-                  index.tryUpdate(*offset, prev_entry, hkey, new_kv_id).await();
-              if (new_res.asUint64() != res.asUint64()) {
-                throw std::runtime_error(
-                    "Error: Failed to overwrite other CAS in the backup index "
-                    "for key " +
-                    true_key + " in server " + std::to_string(1 + main_server));
-              }
-            }
-          }
-
-
-          // Phase 3: Write "log commit"
-          client.writeLogCommit(main_server, kv_id, new_kv_id);
-
-          // Phase 4: Write main index
-          {
-            auto res = main_index.tryUpdate(*offset, prev_entry, hkey, new_kv_id).await();
-            if (res.asUint64() != prev_entry.asUint64()) {
-              throw std::runtime_error("Error: Failed to update the main index for key " + true_key +
-                                      " in server " + std::to_string(1 + main_server));
-            }
-          }
-
-          cache_hit_update_finish:
-
-          pointer_cache.put(hkey, new_kv_id); // TODO(zyf): actually not cache ?
-          // fmt::print("Ts: {}, CachedTs : {}\n", local_log->kv.ts, *(pointer_cache.get(hkey)));
-
-          now = std::chrono::steady_clock::now();
-          if (start_measurements <= i && i < stop_measurements) {
-            auto measure = now - last_time;
-            update_stat.addMeasurement(measure);
-            total_update_time += measure;
-            ++total_update_count;
-          }
-        } else {
-          auto* ignored = client.read(random_server, kv_id);
-          auto matches = search.await();
-
-          auto prev_entry = search.entryFor(kv_id);
-          auto offset = search.getOffsetOf(prev_entry);
-          if (!offset.has_value()) {
-            // Index was updated
-            goto cache_miss_or_fake_hit;
-          }
-
-          now = std::chrono::steady_clock::now();
-          if (start_measurements <= i && i < stop_measurements) {
-            auto measure = now - last_time;
-            get_stat.addMeasurement(measure);
-            total_read_time += measure;
-            ++total_read_count;
-          }
-        }
+        auto search = main_index.search(hkey);
+        uint64_t new_kv_id;
         
-        if (start_measurements <= i && i < stop_measurements) {
-          search_stat.addMeasurement(search_time);
-          total_search_time += search_time;
-          total_true_cache_hit_count += 1;
-        }
+        auto cache_entry = pointer_cache.get(hkey);
+        if (cache_entry) {
+          auto kv_id = *cache_entry;
+          now = std::chrono::steady_clock::now();
+          auto search_time = now - last_time;
+          if (start_measurements <= i && i < stop_measurements) {
+            total_cache_hit_count += 1;
+          }
 
-        last_time = now;
-        continue;
-      }
-
-      // Phase 1.1: Read index
-      if (operation.second.has_value()) {
-        // And pre-write new kv
-        auto value = operation.second.value();
-        auto* local_log = client.prepareToWriteEntry(true_key, value);
-        new_kv_id = client.write(local_log, random_server);
-      }
-
-      cache_miss_or_fake_hit:
-
-      auto sf = search.await();
-      
-      now = std::chrono::steady_clock::now();
-      if (start_measurements <= i && i < stop_measurements) {
-        auto measure = now - last_time;
-        search_stat.addMeasurement(measure);
-        total_search_time += measure;
-      }
-
-      if (sf.nb_matches == 0) {
-        std::cout << "No match for key " << true_key << std::endl;
-        throw std::runtime_error("No match for key");
-      }
-
-      // std::cout << "Multiple matches for key " << true_key << std::endl;
-
-      auto found = false;
-
-      for (size_t j = 0; j < sf.nb_matches; j++) {
-        // Phase 1.2 : read kv(s)
-        auto kv_id = sf.matches[j].getValue();
-        auto entry = client.read(random_server, kv_id);
-
-        if (!(std::strncmp(true_key.c_str(), entry->kv.key(), layout.key_size))) {
-          found = true;
-          if (operation.second.has_value()) {
-            auto value = operation.second.value();
-
+          if (type == OpType::UPDATE) {
+            // --- FIX: Create mutable string copies to satisfy Client::prepareToWriteEntry ---
+            std::string mutable_key = target_key;
+            std::string mutable_val = target_value;
+            auto* local_log = client.prepareToWriteEntry(mutable_key, mutable_val);
+            
+            new_kv_id = client.readAndWrite(local_log, kv_id, random_server).second;
+            auto matches = search.await();
+            
             auto prev_entry = search.entryFor(kv_id);
             auto offset = search.getOffsetOf(prev_entry);
-            if (!offset.has_value()) {
-              throw std::runtime_error("Error: could not find entry ???");
-            }
+            if (!offset.has_value()) { goto cache_miss_fallback; }
 
-            // Phase 2: Update backup indexes
             futures.clear();
             for (size_t s = 1; s < layout.num_servers; s++) {
               auto& index = *(indexes.at((main_server + s) % layout.num_servers));
@@ -546,61 +419,28 @@ int main(int argc, char* argv[]) {
             }
 
             auto res = futures.at(0).await();
-
             if (res.asUint64() != prev_entry.asUint64()) {
-              // Lost the game, letting the other finish.
               auto iter = 0;
               do {
                 res = main_index.tryCheck(*offset).await();
-                if(++iter == 1000) {
-                  fmt::print("Concurrent update from other client (ts: {}), waiting for the update to finish.\r", prev_entry.asUint64());
-                }
               } while(res.asUint64() == prev_entry.asUint64());
               new_kv_id = res.getValue();
-              goto cache_miss_update_finish;
+              goto cache_hit_up_done;
             }
 
             for (size_t s = 2; s < layout.num_servers; s++) {
               res = futures.at(s - 1).await();
-
               if (res.asUint64() != prev_entry.asUint64()) {
-                // Won the game, erasing the other value.
-                auto& index =
-                    *(indexes.at((main_server + s) % layout.num_servers));
-                auto new_res =
-                    index.tryUpdate(*offset, prev_entry, hkey, new_kv_id)
-                        .await();
-                if (new_res.asUint64() != res.asUint64()) {
-                  throw std::runtime_error(
-                      "Error: Failed to overwrite other CAS in the backup "
-                      "index "
-                      "for key " +
-                      true_key + " in server " +
-                      std::to_string(1 + main_server));
-                }
+                auto& index = *(indexes.at((main_server + s) % layout.num_servers));
+                index.tryUpdate(*offset, prev_entry, hkey, new_kv_id).await();
               }
             }
 
-            // Phase 3: Write "log commit"
             client.writeLogCommit(main_server, kv_id, new_kv_id);
+            main_index.tryUpdate(*offset, prev_entry, hkey, new_kv_id).await();
 
-            // Phase 4: Write main index
-            {
-              auto res =
-                  main_index.tryUpdate(*offset, prev_entry, hkey, new_kv_id)
-                      .await();
-              if (res.asUint64() != prev_entry.asUint64()) {
-                throw std::runtime_error(
-                    "Error: Failed to update the main index for key " +
-                    true_key + " in server " + std::to_string(1 + main_server));
-              }
-            }
-
-            cache_miss_update_finish:
-
-            pointer_cache.put(hkey, new_kv_id); // TODO(zyf): actually not cache ?
-            // fmt::print("Ts: {}, CachedTs : {}\n", local_log->kv.ts, *(pointer_cache.get(hkey)));
-
+            cache_hit_up_done:
+            pointer_cache.put(hkey, new_kv_id);
             now = std::chrono::steady_clock::now();
             if (start_measurements <= i && i < stop_measurements) {
               auto measure = now - last_time;
@@ -608,11 +448,101 @@ int main(int argc, char* argv[]) {
               total_update_time += measure;
               ++total_update_count;
             }
-            }
-            else {
-              // Well, we're already done.
-              pointer_cache.put(hkey, kv_id);
+          } else { // READ
+            auto* ignored = client.read(random_server, kv_id);
+            auto matches = search.await();
 
+            auto prev_entry = search.entryFor(kv_id);
+            auto offset = search.getOffsetOf(prev_entry);
+            if (!offset.has_value()) { goto cache_miss_fallback; }
+
+            now = std::chrono::steady_clock::now();
+            if (start_measurements <= i && i < stop_measurements) {
+              auto measure = now - last_time;
+              get_stat.addMeasurement(measure);
+              total_read_time += measure;
+              ++total_read_count;
+            }
+          }
+          
+          if (start_measurements <= i && i < stop_measurements) {
+            search_stat.addMeasurement(search_time);
+            total_search_time += search_time;
+            total_true_cache_hit_count += 1;
+          }
+          last_time = now;
+          return;
+        }
+
+        // Cache Miss Pipeline Execution Block
+        if (type == OpType::UPDATE) {
+          // --- FIX: Create mutable string copies here as well ---
+          std::string mutable_key = target_key;
+          std::string mutable_val = target_value;
+          auto* local_log = client.prepareToWriteEntry(mutable_key, mutable_val);
+          
+          new_kv_id = client.write(local_log, random_server);
+        }
+
+        cache_miss_fallback:
+        auto sf = search.await();
+        now = std::chrono::steady_clock::now();
+        if (start_measurements <= i && i < stop_measurements) {
+          auto measure = now - last_time;
+          search_stat.addMeasurement(measure);
+          total_search_time += measure;
+        }
+
+        if (sf.nb_matches == 0) { throw std::runtime_error("Key not found"); }
+
+        auto found = false;
+        for (size_t j = 0; j < sf.nb_matches; j++) {
+          auto kv_id = sf.matches[j].getValue();
+          auto entry = client.read(random_server, kv_id);
+
+          if (!(std::strncmp(target_key.c_str(), entry->kv.key(), layout.key_size))) {
+            found = true;
+            if (type == OpType::UPDATE) {
+              auto prev_entry = search.entryFor(kv_id);
+              auto offset = search.getOffsetOf(prev_entry);
+              
+              futures.clear();
+              for (size_t s = 1; s < layout.num_servers; s++) {
+                auto& index = *(indexes.at((main_server + s) % layout.num_servers));
+                futures.emplace_back(index.tryUpdate(*offset, prev_entry, hkey, new_kv_id));
+              }
+
+              auto res = futures.at(0).await();
+              if (res.asUint64() != prev_entry.asUint64()) {
+                do {
+                  res = main_index.tryCheck(*offset).await();
+                } while(res.asUint64() == prev_entry.asUint64());
+                new_kv_id = res.getValue();
+                goto cache_miss_up_done;
+              }
+
+              for (size_t s = 2; s < layout.num_servers; s++) {
+                res = futures.at(s - 1).await();
+                if (res.asUint64() != prev_entry.asUint64()) {
+                  auto& index = *(indexes.at((main_server + s) % layout.num_servers));
+                  index.tryUpdate(*offset, prev_entry, hkey, new_kv_id).await();
+                }
+              }
+
+              client.writeLogCommit(main_server, kv_id, new_kv_id);
+              main_index.tryUpdate(*offset, prev_entry, hkey, new_kv_id).await();
+
+              cache_miss_up_done:
+              pointer_cache.put(hkey, new_kv_id);
+              now = std::chrono::steady_clock::now();
+              if (start_measurements <= i && i < stop_measurements) {
+                auto measure = now - last_time;
+                update_stat.addMeasurement(measure);
+                total_update_time += measure;
+                ++total_update_count;
+              }
+            } else { // READ
+              pointer_cache.put(hkey, kv_id);
               now = std::chrono::steady_clock::now();
               if (start_measurements <= i && i < stop_measurements) {
                 auto measure = now - last_time;
@@ -621,26 +551,30 @@ int main(int argc, char* argv[]) {
                 ++total_read_count;
               }
             }
-
-          break;
+            break;
+          }
         }
-        // } else {
-        //   std::cout << "Invalid match for key " << true_key
-        //             << ": " << entry->kv.key()
-        //             << " @ " << kv_id << std::endl;
-        // }
+        if (!found) { throw std::runtime_error("Match evaluation logic failed."); }
+        last_time = now;
+      };
+
+      // Handle the distinct execution flows
+      if (operation.type == OpType::UPDATE) {
+        execute_point_op(operation.key, OpType::UPDATE, operation.value);
+      } 
+      else if (operation.type == OpType::READ) {
+        execute_point_op(operation.key, OpType::READ, "");
+      } 
+      else if (operation.type == OpType::SCAN) {
+        std::string scan_key = operation.key;
+        for (int c = 0; c < operation.scan_count; ++c) {
+          execute_point_op(scan_key, OpType::READ, "");
+          scan_key = IncrementYcsbKey(scan_key);
+        }
       }
-
-      last_time = now;
-
-      if (found == false) {
-        std::cout << sf.nb_matches << " matchs for key " << true_key
-                  << " yet none is correct." << std::endl;
-
-        throw std::runtime_error(
-            "Matchs found for key but no correct match");
-      }
+      now = std::chrono::steady_clock::now();
     }
+
     std::cout << "Done. Results:" << std::endl;
 
     fmt::print("\n");
