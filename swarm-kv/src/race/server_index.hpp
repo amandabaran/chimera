@@ -41,6 +41,7 @@ class ServerIndex {
     }
     cb.emplace(port);
     cb->registerPd("pd");
+    // Server allocates bugger sized to hold the RACE bucket array and registers it for RDMA
     cb->allocateBuffer("buf", allocated_size, 64);
     cb->registerMr(
         "mr", "pd", "buf",
@@ -49,7 +50,7 @@ class ServerIndex {
             ctrl::ControlBlock::REMOTE_ATOMIC);
     cb->registerCq("cq");
 
-    // 4. We establish reliable connections.
+    // 4. We establish reliable connections to all clients.
     auto& store = memstore::MemoryStore::getInstance();
 
     ce.emplace(id, client_ids, *cb);

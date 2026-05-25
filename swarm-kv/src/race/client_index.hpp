@@ -39,16 +39,17 @@ class IndexClient : public std::enable_shared_from_this<IndexClient> {
   LOGGER_DECL_INIT(logger, "IndexClient");
   size_t bucket_bits;
 
+// each inflight operation owns a WrContext slot with its own region of the registered MR
   struct WrContext {
     uint64_t id;
-    uint64_t ongoing_rdma = 0;
+    uint64_t ongoing_rdma = 0; // tracks pending completions
     uint8_t* rdma_buffer;
 
     WrContext(uint64_t id, uint8_t* const rdma_buffer)
         : id{id}, rdma_buffer{rdma_buffer} {}
 
     // Search
-    using IndexBuffer = std::array<BucketGroup, 2>;
+    using IndexBuffer = std::array<BucketGroup, 2>;  // 192 bytes, fits in 2 cache lines, can be read with a single 2×BucketGroup RDMA read
     IndexBuffer& getBuffer() const {
       return *reinterpret_cast<IndexBuffer*>(rdma_buffer);
     }
@@ -64,7 +65,7 @@ class IndexClient : public std::enable_shared_from_this<IndexClient> {
   std::vector<WrContext> wr_ctxs;
 
   std::vector<struct ibv_wc> wce;
-  size_t to_poll = 0;
+  size_t to_poll = 0; // global counter of expected CQEs
 
   WrContext& getWrCtx(uint64_t wr_id) { return wr_ctxs.at(wr_id); }
 
@@ -72,6 +73,10 @@ class IndexClient : public std::enable_shared_from_this<IndexClient> {
     return hkey[0] ^ hkey[7] ^ hkey[8] ^ hkey[15];
   }
 
+  // Each key maps to two candidate bucket positions (RACE's cuckoo property). 
+  // The low bit determines main vs. overflow side within a group. 
+  // The clever & ~1 and += 2 logic ensures the two groups read by the client are always disjoint groups — 
+  // so a single 2×BucketGroup read actually fetches 4 distinct buckets (the two candidate positions × main+overflow each).
   std::array<uint64_t, 2> bucketOffsets(HashedKey const& hkey) const {
     size_t const mask = (1 << bucket_bits) - 1;
     std::array<uint64_t, 2> bucket_ids;
@@ -173,6 +178,8 @@ class IndexClient : public std::enable_shared_from_this<IndexClient> {
     uint64_t ctxWrId() { return reinterpret_cast<uint64_t>(ctx.id); }
   };
 
+  //! This is a interesting trick !!!
+  // Only polls Server 0 CQ because all server connections share the same CQ, so it drains CQEs from all servers
   bool tickRdma(std::vector<bool>& progress) {
     bool any_progress = false;
     wce.resize(to_poll);
@@ -243,6 +250,7 @@ class IndexClient : public std::enable_shared_from_this<IndexClient> {
       // client->rc->postSend(wr[0]);
     }
 
+    // Fires two RDMA reads to fetch the two candidate bucket groups using doorbell batch (first is unsignaled, second is signaled, both reads share one CQE)
     void search(HashedKey const& hkey) {
       main_server_idx = *reinterpret_cast<uint64_t const*>(hkey.data()) %
                         client->server_connections.size();

@@ -2,9 +2,10 @@
 
 #include <cstdint>
 
-constexpr uint64_t TsSize = 32;
-constexpr uint64_t LogIdSize = 24;
-constexpr uint64_t ClientIdSize = 7;
+constexpr uint64_t TsSize = 32; // 32 bit timestamp monotonic clock
+constexpr uint64_t LogIdSize = 24; // 24 bit per client log slot index
+constexpr uint64_t ClientIdSize = 7; //7 bit client proc id (up to 128 clients)
+                                     // 1 bit for validation flag (least significant bit, bit 0)
 
 constexpr uint64_t TsMask = (1ULL << TsSize) - 1;
 constexpr uint64_t LogIdMask = (1ULL << LogIdSize) - 1;

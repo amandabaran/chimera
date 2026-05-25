@@ -22,15 +22,15 @@ struct BucketEntry {
   }
   Value getValue() const { return value & ValueMask; }
 
-  bool used : 1;
+  bool used : 1; //flag for empty slot detection
   uint64_t padding : 7;
-  Checksum checksum : 8;
-  Value value : 48;
-};
+  Checksum checksum : 8; // 8 bit fingerprint
+  Value value : 48; // 48 bit pointer to actual value
+}; // 8 Bytes total for CAS ops
 
 static_assert(sizeof(BucketEntry) == sizeof(uint64_t));
-using Bucket = std::array<BucketEntry, NbBucketEntries>;
-using BucketGroup = std::array<Bucket, 2>;
+using Bucket = std::array<BucketEntry, NbBucketEntries>;  // One Bucket is an array of 6 Bucket entries (48 bytes total, fits in a cache line)
+using BucketGroup = std::array<Bucket, 2>;  // BucketGroup pairs a main bucket with an overflow bucket (96 bytes total)
 
 }  // namespace dory::race
 
