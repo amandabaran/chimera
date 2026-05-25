@@ -85,8 +85,8 @@ bool MemoryStore::get(std::string const &key, std::string &value) {
     value += ret;
     return true;
   }
-  if (rc == MEMCACHED_NOTFOUND) {
-    return false;
+  if (rc == MEMCACHED_NOTFOUND || rc == MEMCACHED_TIMEOUT) {
+    return false; 
   }
   throw std::runtime_error(
       "Failed to get from the store the K = " + key + " (" +

@@ -139,7 +139,20 @@ int main(int argc, char* argv[]) {
   ctrl::OpenDevice od;
 
   // Get the last device
-  od = std::move(d.list().back());
+  auto& available_devices = d.list();
+  size_t target_index = 0; // This corresponds to the 3rd device (uverbs2 or mlx5_2)
+
+  if (available_devices.size() > target_index) {
+      od = std::move(available_devices[target_index]);
+      std::cout << "Selected device: " << od.devName() << std::endl;
+  } else {
+      std::cerr << "Error: Device index " << target_index << " not available." << std::endl;
+      std::cerr << "Available devices: ";
+      for (auto const& dev : available_devices) std::cerr << dev.devName() << " ";
+      std::cerr << std::endl;
+      return 1;
+  }
+
 
   std::cout << od.name() << " " << od.devName() << " "
             << ctrl::OpenDevice::typeStr(od.nodeType()) << " "

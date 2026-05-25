@@ -150,7 +150,20 @@ int main(int argc, char* argv[]) {
   ctrl::OpenDevice od;
 
   // Get the last device
-  od = std::move(d.list().back());
+  // od = std::move(d.list().back());
+  auto& available_devices = d.list();
+  size_t target_index = 0; // This corresponds to the 3rd device (uverbs2 or mlx5_2)
+
+  if (available_devices.size() > target_index) {
+      od = std::move(available_devices[target_index]);
+      std::cout << "Selected device: " << od.devName() << std::endl;
+  } else {
+      std::cerr << "Error: Device index " << target_index << " not available." << std::endl;
+      std::cerr << "Available devices: ";
+      for (auto const& dev : available_devices) std::cerr << dev.devName() << " ";
+      std::cerr << std::endl;
+      return 1;
+  }
 
   std::cout << od.name() << " " << od.devName() << " "
             << ctrl::OpenDevice::typeStr(od.nodeType()) << " "
@@ -221,10 +234,14 @@ int main(int argc, char* argv[]) {
   ce.unannounceReady(store, "qp", "prepared");
 
   if (is_client) {
+    // CLIENT SETUP
+
+    // Owns the MRs, futures, latency stats
     OopsClient client{
         layout,          ce,          proc_id,   pointer_cache_size,
         measure_batches, death_point, iter_count};
 
+    // Workload Loader to insert keys into KVS froom YCSB workload file
     if (proc_id == layout.firstClientId()) {
       std::cout << "Querying YCSB for the set of initial key-pairs... "
                 << std::flush;
@@ -269,6 +286,8 @@ int main(int argc, char* argv[]) {
 
       std::cout << " Done." << std::endl;
     }
+    
+    // All Clients parse YCSB run ouput into KV pairs and operations
 
     std::cout << "Querying YCSB for the list of operations... " << std::flush;
     std::vector<std::pair<std::string, std::optional<std::string>>> operations =
@@ -305,6 +324,20 @@ int main(int argc, char* argv[]) {
     }
 
     std::cout << "Done." << std::endl;
+
+    std::cout << "\n=== Parsed YCSB Operations (First 20 items) ===\n";
+    size_t print_limit = std::min(operations.size(), size_t(20)); // Limit output so it doesn't flood your terminal
+    for (size_t i = 0; i < print_limit; i++) {
+      auto& [key, value] = operations[i];
+      
+      if (value.has_value()) {
+        std::cout << fmt::format("[OpType: UPDATE] -> Key: '{}', Value: '{}'\n", key, value.value());
+      } else {
+        std::cout << fmt::format("[OpType: READ  ] -> Key: '{}'\n", key);
+      }
+    }
+    std::cout << "===============================================\n\n";
+
     std::cout << "Waiting for the initialization of other clients... "
               << std::flush;
 
@@ -312,6 +345,7 @@ int main(int argc, char* argv[]) {
     ce.waitReadyAll(store, "qp", "initialized");
 
     std::cout << "Done." << std::endl;
+    // START WORKLOAD
     std::cout << "Running the benchmark... " << std::endl;
 
     client.initClock();
@@ -320,7 +354,7 @@ int main(int argc, char* argv[]) {
     std::chrono::steady_clock::time_point end;
     bool measuring = false;
     size_t skipped = 0;
-
+    // WORKLOAD LOOP - iterate through the list of operations and execute them on the KVS, while measuring latency and throughput
     for (size_t i = 0; i < total_iter_count; i++) {
 
       retry_next_key:
@@ -358,7 +392,7 @@ int main(int argc, char* argv[]) {
     client.finishAllFutures();
 
     std::cout << "Done. Results:" << std::endl;
-
+    // WORKLOAD IS DONE, FINALIZE METRICS AND REPORT
     client.reportStats(detailed);
     fmt::print(
         "Local tput: {}kpos\n",
@@ -369,6 +403,7 @@ int main(int argc, char* argv[]) {
     ce.waitReadyAll(store, "qp", "finished");
     ce.unannounceReady(store, "qp", "initialized");
   } else {
+    // SERVER/REPLICA SETUP
     std::vector<ProcId> client_ids;
     for (ProcId id = layout.firstClientId();
          id < layout.firstClientId() + layout.num_clients; id++) {
