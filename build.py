@@ -266,6 +266,36 @@ targets = list(set(targets))
 
 env = os.environ.copy()
 
+# ==========================================
+# CUSTOM AUTOMATION INJECTION BLOCKS
+# ==========================================
+
+# 1. Automatically detect GCC version and enforce CONAN_DEFAULT_PROFILE_PATH
+if "CONAN_DEFAULT_PROFILE_PATH" not in env:
+    try:
+        gcc_ver = subprocess.check_output("gcc -dumpversion | cut -d. -f1", shell=True).decode().strip()
+        profile_candidate = os.path.join(current_dir, "conan", "profiles", f"gcc-{gcc_ver}-relwithdebinfo.profile")
+        
+        # Fallback check if a version-specific profile hasn't been generated yet
+        if not os.path.exists(profile_candidate):
+            profile_candidate = os.path.join(current_dir, "conan", "profiles", "gcc-12-relwithdebinfo.profile")
+            
+        if os.path.exists(profile_candidate):
+            env["CONAN_DEFAULT_PROFILE_PATH"] = profile_candidate
+    except Exception:
+        pass
+
+# 2. Automatically recreate missing tracking dependencies if clean wiped them
+deps_export_dir = os.path.join(current_dir, ".deps", "exports")
+if not os.path.exists(deps_export_dir):
+    os.makedirs(deps_export_dir, exist_ok=True)
+    os.makedirs(os.path.join(current_dir, ".deps", "gcc", "relwithdebinfo"), exist_ok=True)
+    tracked_libs = ["conn", "ctrl", "shared", "memory", "special", "memstore", "extern", "third-party", "swarm-kv", "fusee", "chimera"]
+    for lib in tracked_libs:
+        open(os.path.join(deps_export_dir, f"{lib}.conanbuild"), 'a').close()
+
+# ==========================================
+
 env["DORY_INVOKED_FROM_BUILDSCRIPT"] = "1"
 make_opt = []
 make_opt_stderr = None

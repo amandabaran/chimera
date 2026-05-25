@@ -31,11 +31,5 @@ struct Register {
     bool operator==(const Register& other) const { return raw == other.raw; }
 };
 
-// 2. Padded Registr. For local scratchpad array - padded to 64B to prevent false sharing.
-struct alignas(64) PaddedRegister {
-    Register reg;
-private:
-    uint8_t padding[56]; 
-};
-
 static_assert(sizeof(Register) == 8, "RDMA CAS requires exactly 8 bytes");
+static_assert(sizeof(Register) == sizeof(uint64_t), "Register must be CAS-able");

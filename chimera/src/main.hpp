@@ -32,5 +32,4 @@
 
 #include <dory/extern/ibverbs.hpp>
 
-using ProcId = uint64_t;
 using ConnectionExchanger = dory::conn::RcConnectionExchanger<ProcId>;
