@@ -157,25 +157,32 @@ int main(int argc, char** argv) {
     // ─── Device + port ─────────────────────────────────────────────
     ctrl::Devices d;
     ctrl::OpenDevice od;
-    bool found = false;
-    for (auto& dev : d.list()) {
-        std::string name(dev.devName());
-        if (name == "mlx5_2" || name == "mlx5_0") {
-            od = std::move(dev);
-            found = true;
-            break;
-        }
-    }
-    if (!found) {
-        std::cerr << "Error: IB device not found." << std::endl;
+    auto& available_devices = d.list();
+    size_t target_index = 0; // This corresponds to the 3rd device (uverbs2 or mlx5_2)
+
+    if (available_devices.size() > target_index) {
+        od = std::move(available_devices[target_index]);
+        std::cout << "Selected device: " << od.devName() << std::endl;
+    } else {
+        std::cerr << "Error: Device index " << target_index << " not available." << std::endl;
+        std::cerr << "Available devices: ";
+        for (auto const& dev : available_devices) std::cerr << dev.devName() << " ";
+        std::cerr << std::endl;
         return 1;
     }
-    std::cout << "Selected device: " << od.devName() << std::endl;
+
+    std::cout << od.name() << " " << od.devName() << " "
+            << ctrl::OpenDevice::typeStr(od.nodeType()) << " "
+            << ctrl::OpenDevice::typeStr(od.transportType()) << std::endl;
 
     ctrl::ResolvedPort resolved_port(od);
-    if (!resolved_port.bindTo(0)) {
-        throw std::runtime_error("Couldn't bind the RDMA device.");
+    auto binded = resolved_port.bindTo(0);
+    if (!binded) {
+        throw std::runtime_error("Couldn't bind the device.");
     }
+    std::cout << "Binded successfully (port_id, port_lid) = ("
+                << +resolved_port.portId() << ", " << +resolved_port.portLid()
+                << ")" << std::endl;
 
     // ─── Control block & MR ────────────────────────────────────────
     ctrl::ControlBlock cb(resolved_port);
