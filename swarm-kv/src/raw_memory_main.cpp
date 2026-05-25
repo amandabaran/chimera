@@ -23,6 +23,31 @@ const int64_t start_measurements = warmup;
 const int64_t stop_measurements = start_measurements + iter_count;
 const int64_t total_iter_count = stop_measurements + keepwarm;
 
+enum class OpType { READ, UPDATE, SCAN };
+
+struct KvsOp {
+  OpType type;
+  std::string key;
+  std::string value; // Used for UPDATE
+  int scan_count;    // Used for SCAN
+};
+
+inline std::string IncrementYcsbKey(const std::string& key) {
+    size_t non_digit = key.find_first_of("0123456789");
+    if (non_digit == std::string::npos) return key + "0"; 
+    
+    std::string prefix = key.substr(0, non_digit);
+    long long num = std::stoll(key.substr(non_digit));
+    num++;
+    
+    std::string num_str = std::to_string(num);
+    int padding_needed = static_cast<int>(key.length() - prefix.length() - num_str.length());
+    if (padding_needed > 0) {
+        return prefix + std::string(padding_needed, '0') + num_str;
+    }
+    return prefix + num_str;
+}
+
 static thread_local std::vector<struct ibv_wc> wces{1};
 
 static void completeRdma(ReliableConnection& rc) {
@@ -315,23 +340,20 @@ int main(int argc, char* argv[]) {
     }
 
     std::cout << "Querying YCSB for the list of operations... " << std::flush;
-    std::vector<std::pair<std::string, std::optional<std::string>>> operations =
-        {};
+    std::vector<KvsOp> operations = {}; // Uses the new KvsOp struct directly
 
     {
       auto output =
           exec(ycsb_path + " run basic -P " + workload + " -s 2> /dev/null");
       std::string line;
       while (std::getline(output, line)) {
-        if (!(std::strncmp("READ ", line.c_str(),
-                           std::string("READ ").length()))) {
+        if (!(std::strncmp("READ ", line.c_str(), std::string("READ ").length()))) {
           auto keystart = std::string("READ usertable ").length();
           auto keyend = line.find(" [", keystart);
           auto key = line.substr(keystart, keyend - keystart);
 
-          operations.emplace_back(key, std::optional<std::string>());
-        } else if (!(std::strncmp("UPDATE ", line.c_str(),
-                                  std::string("UPDATE ").length()))) {
+          operations.push_back({OpType::READ, key, "", 0});
+        } else if (!(std::strncmp("UPDATE ", line.c_str(), std::string("UPDATE ").length()))) {
           auto keystart = std::string("UPDATE usertable ").length();
           auto keyend = line.find(" [", keystart);
           auto key = line.substr(keystart, keyend - keystart);
@@ -340,8 +362,17 @@ int main(int argc, char* argv[]) {
           auto end = line.length() - std::string(" ]").length();
           auto value = line.substr(start, end - start);
 
-          operations.emplace_back(key, std::optional<std::string>(value));
+          operations.push_back({OpType::UPDATE, key, value, 0});
+        } else if (!(std::strncmp("SCAN ", line.c_str(), std::string("SCAN ").length()))) {
+          auto keystart = std::string("SCAN usertable ").length();
+          auto keyend = line.find(" ", keystart);
+          auto key = line.substr(keystart, keyend - keystart);
+          
+          auto countstart = keyend + 1;
+          auto countend = line.find(" [", countstart);
+          int count = std::stoi(line.substr(countstart, countend - countstart));
 
+          operations.push_back({OpType::SCAN, key, "", count});
         } else {
           continue;
         }
@@ -349,6 +380,22 @@ int main(int argc, char* argv[]) {
     }
 
     std::cout << "Done." << std::endl;
+    
+    // Debug output log block to confirm layout matching
+    std::cout << "\n=== Parsed YCSB Operations (First 20 items) ===\n";
+    size_t print_limit = std::min(operations.size(), size_t(20)); 
+    for (size_t i = 0; i < print_limit; i++) {
+      auto& op = operations[i];
+      if (op.type == OpType::UPDATE) {
+        std::cout << fmt::format("[OpType: UPDATE] -> Key: '{}', Value: '{}'\n", op.key, op.value);
+      } else if (op.type == OpType::READ) {
+        std::cout << fmt::format("[OpType: READ  ] -> Key: '{}'\n", op.key);
+      } else if (op.type == OpType::SCAN) {
+        std::cout << fmt::format("[OpType: SCAN  ] -> Key: '{}', Count: {}\n", op.key, op.scan_count);
+      }
+    }
+    std::cout << "===============================================\n\n";
+
     std::cout << "Waiting for the initialization of other clients... "
               << std::flush;
 
@@ -362,8 +409,11 @@ int main(int argc, char* argv[]) {
     std::chrono::steady_clock::time_point very_end;
     bool measureLatency = false;
 
+    // Workload Loop
+    // WORKLOAD LOOP
     for (size_t i = 0; i < total_iter_count; i++) {
-      auto& [key, optvalue] = operations[i % operations.size()];
+      auto& op = operations[i % operations.size()]; // Clean struct reference
+      
       if (i == start_measurements) {
         measureLatency = true;
         very_start = std::chrono::steady_clock::now();
@@ -372,79 +422,93 @@ int main(int argc, char* argv[]) {
         very_end = std::chrono::steady_clock::now();
       }
 
-      // Search key
-      auto start = std::chrono::steady_clock::now();
-      auto hkey = hash(key);
-      auto cache_entry = state.pointer_cache.get(hkey);
-      uint64_t kv_id = 0ul;
-      if (!cache_entry) {
-        index_future.search(hkey);
-        while (!index_future.isDone()) {
-          state.index->tickRdma(progress);
-          index_future.tryStepForward();
+      // Lambda helper to process a single point lookup/mutation inside this runner engine
+      auto execute_point_op = [&](const std::string& target_key, OpType type, const std::string& target_value) {
+        auto start = std::chrono::steady_clock::now();
+        auto hkey = hash(target_key);
+        auto cache_entry = state.pointer_cache.get(hkey);
+        uint64_t kv_id = 0ul;
+
+        if (!cache_entry) {
+          index_future.search(hkey);
+          while (!index_future.isDone()) {
+            state.index->tickRdma(progress);
+            index_future.tryStepForward();
+          }
+          auto& result = index_future.get();
+          if (result.nb_matches == 0) {
+            throw std::runtime_error("Key not found during read: " + target_key);
+          }
+          kv_id = result.matches[0].value();
+        } else {
+          kv_id = (*cache_entry).first;
         }
-        auto& result = index_future.get();
-        if (result.nb_matches == 0) {
-          throw std::runtime_error("Key not found during read.");
-        }
-        kv_id = result.matches[0].value();
-      } else {
-        kv_id = (*cache_entry).first;
-      }
 
-      if (measureLatency) {
-        // TODO(zyf): TOFIX: check that we read the correct KV ?
-        auto search_end = std::chrono::steady_clock::now();
-        state.search_profiler.addMeasurement(search_end - start);
-      }
-
-      // Read or write key
-      auto remote_kv = layout.getServerKVAddress(rc.remoteBuf(), kv_id);
-      if (optvalue) {
-        std::string value = *optvalue;
-
-        if (key.size() >= state.layout.key_size) {
-          throw std::runtime_error("Key too long.");
-        }
-        if (value.size() >= state.layout.value_size) {
-          throw std::runtime_error("Value too long.");
-        }
-        auto* vp = state.layout.valueOf(entry->kv);
-        auto* kp = state.layout.keyOf(entry->kv);
-
-        key.copy(kp, state.layout.key_size);
-        value.copy(vp, state.layout.value_size);
-        memset(kp + key.size(), 0,
-               state.layout.key_size - key.size());
-        memset(vp + value.size(), 0,
-               state.layout.value_size - value.size());
-
-        rc.postSendSingle(dory::conn::ReliableConnection::RdmaWrite, 0,
-                          state.layout.rawKVOf(entry->kv),
-                          state.layout.rawKVSize(),
-                          remote_kv + state.layout.rawKVOffset());
-        completeRdma(rc);
         if (measureLatency) {
-          auto end = std::chrono::steady_clock::now();
-          state.update_profiler.addMeasurement(end - start);
+          auto search_end = std::chrono::steady_clock::now();
+          state.search_profiler.addMeasurement(search_end - start);
         }
-      } else {
-        rc.postSendSingle(dory::conn::ReliableConnection::RdmaRead, 0,
-                          state.layout.rawKVOf(entry->kv),
-                          state.layout.rawKVSize(),
-                          remote_kv + state.layout.rawKVOffset());
-        completeRdma(rc);
-        if (measureLatency) {
-          auto end = std::chrono::steady_clock::now();
-          state.get_profiler.addMeasurement(end - start);
-        }
-      }
 
-      if (!cache_entry) {
-        state.pointer_cache.put(hkey, {kv_id, 0ul});
+        auto remote_kv = layout.getServerKVAddress(rc.remoteBuf(), kv_id);
+
+        if (type == OpType::UPDATE) {
+          if (target_key.size() >= state.layout.key_size || target_value.size() >= state.layout.value_size) {
+            throw std::runtime_error("Key/Value limit bounds violation.");
+          }
+          auto* vp = state.layout.valueOf(entry->kv);
+          auto* kp = state.layout.keyOf(entry->kv);
+
+          target_key.copy(kp, state.layout.key_size);
+          target_value.copy(vp, state.layout.value_size);
+          memset(kp + target_key.size(), 0, state.layout.key_size - target_key.size());
+          memset(vp + target_value.size(), 0, state.layout.value_size - target_value.size());
+
+          rc.postSendSingle(dory::conn::ReliableConnection::RdmaWrite, 0,
+                            state.layout.rawKVOf(entry->kv),
+                            state.layout.rawKVSize(),
+                            remote_kv + state.layout.rawKVOffset());
+          completeRdma(rc);
+
+          if (measureLatency) {
+            auto end = std::chrono::steady_clock::now();
+            state.update_profiler.addMeasurement(end - start);
+          }
+        } 
+        else { // handles OpType::READ or simulated entries inside SCAN
+          rc.postSendSingle(dory::conn::ReliableConnection::RdmaRead, 0,
+                            state.layout.rawKVOf(entry->kv),
+                            state.layout.rawKVSize(),
+                            remote_kv + state.layout.rawKVOffset());
+          completeRdma(rc);
+
+          if (measureLatency) {
+            auto end = std::chrono::steady_clock::now();
+            state.get_profiler.addMeasurement(end - start);
+          }
+        }
+
+        if (!cache_entry) {
+          state.pointer_cache.put(hkey, {kv_id, 0ul});
+        }
+      };
+
+      // Direct the operation configurations using the structural tracking flag
+      if (op.type == OpType::UPDATE) {
+        execute_point_op(op.key, OpType::UPDATE, op.value);
+      } 
+      else if (op.type == OpType::READ) {
+        execute_point_op(op.key, OpType::READ, "");
+      } 
+      else if (op.type == OpType::SCAN) {
+        std::string current_scan_key = op.key;
+        for (int c = 0; c < op.scan_count; ++c) {
+          // Sequentially read each consecutive key, filling latency telemetry fields
+          execute_point_op(current_scan_key, OpType::READ, "");
+          current_scan_key = IncrementYcsbKey(current_scan_key);
+        }
       }
     }
-
+    
     std::cout << "Done. Results:" << std::endl;
 
     state.reportStats(detailed);

@@ -20,6 +20,23 @@ const uint64_t default_warmup = 1'000'000;
 const uint64_t default_iter_count = 1'000'000;
 const uint64_t default_keepwarm = 500'000;
 
+inline std::string IncrementYcsbKey(const std::string& key) {
+    size_t non_digit = key.find_first_of("0123456789");
+    if (non_digit == std::string::npos) return key + "0"; 
+    
+    std::string prefix = key.substr(0, non_digit);
+    long long num = std::stoll(key.substr(non_digit));
+    num++;
+    
+    std::string num_str = std::to_string(num);
+    // Pad out zero configurations to match exact structural constraints of the KVS index
+    int padding_needed = static_cast<int>(key.length() - prefix.length() - num_str.length());
+    if (padding_needed > 0) {
+        return prefix + std::string(padding_needed, '0') + num_str;
+    }
+    return prefix + num_str;
+}
+
 int main(int argc, char* argv[]) {
   ProcId proc_id = 0;
 
@@ -290,23 +307,28 @@ int main(int argc, char* argv[]) {
     // All Clients parse YCSB run ouput into KV pairs and operations
 
     std::cout << "Querying YCSB for the list of operations... " << std::flush;
-    std::vector<std::pair<std::string, std::optional<std::string>>> operations =
-        {};
+    enum class OpType { READ, UPDATE, SCAN };
+
+    struct KvsOp {
+      OpType type;
+      std::string key;
+      std::string value; // Used for UPDATE
+      int scan_count;    // Used for SCAN
+    };
+    std::vector<KvsOp> operations = {};
 
     {
       auto output =
           exec(ycsb_path + " run basic -P " + workload + " -s 2> /dev/null");
       std::string line;
       while (std::getline(output, line)) {
-        if (!(std::strncmp("READ ", line.c_str(),
-                           std::string("READ ").length()))) {
+        if (!(std::strncmp("READ ", line.c_str(), std::string("READ ").length()))) {
           auto keystart = std::string("READ usertable ").length();
           auto keyend = line.find(" [", keystart);
           auto key = line.substr(keystart, keyend - keystart);
 
-          operations.emplace_back(key, std::optional<std::string>());
-        } else if (!(std::strncmp("UPDATE ", line.c_str(),
-                                  std::string("UPDATE ").length()))) {
+          operations.push_back({OpType::READ, key, "", 0});
+        } else if (!(std::strncmp("UPDATE ", line.c_str(), std::string("UPDATE ").length()))) {
           auto keystart = std::string("UPDATE usertable ").length();
           auto keyend = line.find(" [", keystart);
           auto key = line.substr(keystart, keyend - keystart);
@@ -315,8 +337,18 @@ int main(int argc, char* argv[]) {
           auto end = line.length() - std::string(" ]").length();
           auto value = line.substr(start, end - start);
 
-          operations.emplace_back(key, std::optional<std::string>(value));
+          operations.push_back({OpType::UPDATE, key, value, 0});
+        } else if (!(std::strncmp("SCAN ", line.c_str(), std::string("SCAN ").length()))) {
+          // Format: SCAN usertable userXXXXX count [ fields ]
+          auto keystart = std::string("SCAN usertable ").length();
+          auto keyend = line.find(" ", keystart);
+          auto key = line.substr(keystart, keyend - keystart);
+          
+          auto countstart = keyend + 1;
+          auto countend = line.find(" [", countstart);
+          int count = std::stoi(line.substr(countstart, countend - countstart));
 
+          operations.push_back({OpType::SCAN, key, "", count});
         } else {
           continue;
         }
@@ -325,15 +357,17 @@ int main(int argc, char* argv[]) {
 
     std::cout << "Done." << std::endl;
 
-    std::cout << "\n=== Parsed YCSB Operations (First 20 items) ===\n";
-    size_t print_limit = std::min(operations.size(), size_t(20)); // Limit output so it doesn't flood your terminal
+   std::cout << "\n=== Parsed YCSB Operations (First 20 items) ===\n";
+    size_t print_limit = std::min(operations.size(), size_t(20)); 
     for (size_t i = 0; i < print_limit; i++) {
-      auto& [key, value] = operations[i];
+      auto& op = operations[i]; // Grab the struct reference directly
       
-      if (value.has_value()) {
-        std::cout << fmt::format("[OpType: UPDATE] -> Key: '{}', Value: '{}'\n", key, value.value());
-      } else {
-        std::cout << fmt::format("[OpType: READ  ] -> Key: '{}'\n", key);
+      if (op.type == OpType::UPDATE) {
+        std::cout << fmt::format("[OpType: UPDATE] -> Key: '{}', Value: '{}'\n", op.key, op.value);
+      } else if (op.type == OpType::READ) {
+        std::cout << fmt::format("[OpType: READ  ] -> Key: '{}'\n", op.key);
+      } else if (op.type == OpType::SCAN) {
+        std::cout << fmt::format("[OpType: SCAN  ] -> Key: '{}', Count: {}\n", op.key, op.scan_count);
       }
     }
     std::cout << "===============================================\n\n";
@@ -355,23 +389,22 @@ int main(int argc, char* argv[]) {
     bool measuring = false;
     size_t skipped = 0;
     // WORKLOAD LOOP - iterate through the list of operations and execute them on the KVS, while measuring latency and throughput
+    // WORKLOAD LOOP
     for (size_t i = 0; i < total_iter_count; i++) {
 
       retry_next_key:
-      auto& [key, value] = operations[(i + skipped) % operations.size()];
+      auto& op = operations[(i + skipped) % operations.size()]; // Clean struct reference
 
       if (layout.async_parallelism > 1) {
-        auto hkey = hash(key);
-        for (size_t i = 0; i < layout.async_parallelism; i++) {
-          auto& future = client.getFuture(i);
+        auto hkey = hash(op.key); // Use op.key
+        for (size_t p = 0; p < layout.async_parallelism; p++) {
+          auto& future = client.getFuture(p);
           if (future.hkey == hkey && !(future.isDone())) {
             ++skipped;
             goto retry_next_key;
           }
         }
       }
-
-      auto& future = client.getFreeFuture();
 
       if (i == start_measurements) {
         measuring = true;
@@ -382,10 +415,21 @@ int main(int argc, char* argv[]) {
         end = std::chrono::steady_clock::now();
       }
 
-      if (value.has_value()) {
-        future.doUpdate(key, value.value(), measuring);
-      } else {
-        future.doRead(key, measuring);
+      if (op.type == OpType::UPDATE) {
+        auto& future = client.getFreeFuture();
+        future.doUpdate(op.key, op.value, measuring);
+      } 
+      else if (op.type == OpType::READ) {
+        auto& future = client.getFreeFuture();
+        future.doRead(op.key, measuring);
+      } 
+      else if (op.type == OpType::SCAN) {
+        std::string target_scan_key = op.key;
+        for (int c = 0; c < op.scan_count; ++c) {
+          auto& future = client.getFreeFuture();
+          future.doRead(target_scan_key, measuring);
+          target_scan_key = IncrementYcsbKey(target_scan_key);
+        }
       }
     }
 
