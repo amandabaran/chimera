@@ -285,9 +285,18 @@ int main(int argc, char** argv) {
             std::cout << " Done." << std::endl;
         }
 
-        // SWARM PATTERN: Load continuous execution operations
+        // ─── DEFINITIONS FOR WORKLOAD E/C SUPPORT ───────────────────────────
+        enum class OpType { READ, UPDATE, SCAN };
+
+        struct ChimeraOp {
+            OpType type;
+            std::string key;
+            std::string value; 
+            uint64_t scan_count; // Changed to uint64_t to resolve -Werror sign-compare
+        };
+
         std::cout << "Querying YCSB for the list of operations... " << std::flush;
-        std::vector<std::pair<std::string, std::optional<std::string>>> operations = {};
+        std::vector<ChimeraOp> operations = {}; // Explicitly typed vector
 
         {
             auto fp = exec(ycsb_path + " run basic -P " + workload + " -s 2> /dev/null");
@@ -299,7 +308,7 @@ int main(int argc, char** argv) {
                     auto keyend = line.find(" [", keystart);
                     auto key = line.substr(keystart, keyend - keystart);
 
-                    operations.emplace_back(key, std::nullopt);
+                    operations.push_back({OpType::READ, key, "", 0});
                 } else if (!(std::strncmp("UPDATE ", line.c_str(), 7))) {
                     auto keystart = std::string("UPDATE usertable ").length();
                     auto keyend = line.find(" [", keystart);
@@ -309,7 +318,17 @@ int main(int argc, char** argv) {
                     auto end = line.length() - std::string(" ]\n").length();
                     auto value = line.substr(start, end - start);
 
-                    operations.emplace_back(key, std::optional<std::string>(value));
+                    operations.push_back({OpType::UPDATE, key, value, 0});
+                } else if (!(std::strncmp("SCAN ", line.c_str(), 5))) {
+                    auto keystart = std::string("SCAN usertable ").length();
+                    auto keyend = line.find(" ", keystart);
+                    auto key = line.substr(keystart, keyend - keystart);
+                    
+                    auto countstart = keyend + 1;
+                    auto countend = line.find(" [", countstart);
+                    uint64_t count = std::stoull(line.substr(countstart, countend - countstart));
+
+                    operations.push_back({OpType::SCAN, key, "", count});
                 }
             }
         }
@@ -327,17 +346,16 @@ int main(int argc, char** argv) {
         bool measuring = false;
         size_t skipped = 0;
 
+        // ─── MAIN BENCHMARK LOOP ────────────────────────────────────────────
         for (size_t i = 0; i < total_iter_count; i++) {
             
             retry_next_key:
-            auto& [key, value] = operations[(i + skipped) % operations.size()];
+            auto& op = operations[(i + skipped) % operations.size()];
 
             // Duplicate Swarm-KV logic checking ongoing pipeline slots for hash conflicts
             if (layout.async_parallelism > 1) {
-                size_t hkey = pseudo_hash(key);
-                // Chimera manages futures asynchronously via internal state queues; 
-                // We enforce a clean skip pattern to prevent overlapping structural collisions.
-                // If needed, check your future tracker identifiers here.
+                size_t hkey = pseudo_hash(op.key);
+                // (Keep any custom pipeline hazard tracking logic from your original build here)
             }
 
             auto& future = client.getFreeFuture();
@@ -350,17 +368,33 @@ int main(int argc, char** argv) {
                 end_time = std::chrono::steady_clock::now();
             }
 
-            // Convert raw alphanumeric YCSB key (e.g. "user23490") to integer bounds mapping
-            uint64_t target_reg = std::stoull(key.substr(4)) % layout.num_registers;
+            // Convert alphanumeric YCSB key (e.g. "user23490") to integer bounds mapping
+            uint64_t target_reg = std::stoull(op.key.substr(4)) % layout.num_registers;
 
-            if (value.has_value()) {
+            if (op.type == OpType::UPDATE) {
                 future.doPut(target_reg, 69, measuring);
-            } else {
+            } 
+            else if (op.type == OpType::READ) {
                 future.doGet(target_reg, measuring);
+            } 
+            else if (op.type == OpType::SCAN) {
+                uint64_t valid_count = op.scan_count;
+                if (target_reg + valid_count > layout.num_registers) {
+                    valid_count = layout.num_registers - target_reg;
+                }
+                if (valid_count > layout.max_range) {
+                    valid_count = layout.max_range;
+                }
+                
+                if (valid_count > 0) {
+                    future.doRange(target_reg, static_cast<uint32_t>(valid_count), measuring);
+                } else {
+                    future.doGet(target_reg, measuring);
+                }
             }
             client.getState().ops_completed++;
         }
-
+        
         client.finishAllFutures();
         std::cout << "Done. Results:" << std::endl;
 
