@@ -34,7 +34,8 @@ class LatencyProfiler {
   };
 
   LatencyProfiler() {
-    grp.emplace_back(Nano(0), Micro(1000), Nano(5));
+    // FIXED: Changed upper bound from Micro(1000) to Micro(1) to fix range overlapping
+    grp.emplace_back(Nano(0), Micro(1), Nano(5));
     grp.emplace_back(Micro(1), Micro(10), Nano(10));
     grp.emplace_back(Micro(10), Micro(20), Nano(20));
     grp.emplace_back(Micro(20), Micro(50), Nano(100));
@@ -62,7 +63,6 @@ class LatencyProfiler {
     auto d = std::chrono::duration_cast<Nano>(duration);
     measurement_idx++;
     total_time += d;
-    // auto count = d.count();
 
     if (d < std::chrono::nanoseconds(0)) {
       fmt::print("!PROFILER WARNING! Duration underflow: {}\n", d);
@@ -70,7 +70,6 @@ class LatencyProfiler {
     }
 
     if (duration >= grp.back().end) {
-      // fmt::print("!PROFILER WARN! {} > max {}.\n", duration, grp.back().end);
       return;
     }
 
@@ -132,29 +131,30 @@ class LatencyProfiler {
       return std::to_string(dd.count()) + "us";
     }
 
-    /*if (d < Milli(1000))*/ {
+    {
       Milli dd = std::chrono::duration_cast<Milli>(d);
       return std::to_string(dd.count()) + "ms";
     }
   }
 
+  // FIXED: Wrapped duration outputs inside prettyTime() for clean rendering
   void report(bool detailed = false) const {
     fmt::print("Number of measurements: {}.\n", measurement_idx);
     fmt::print("Average latency: {}.\n", measurement_idx > 0
-                                             ? total_time / measurement_idx
-                                             : total_time / 1ul);
+                                             ? prettyTime(total_time / measurement_idx)
+                                             : prettyTime(total_time));
     if (detailed) {
-      fmt::print("{}%: {}.\n", 0.1, percentile(0.1));
+      fmt::print("{}%: {}.\n", 0.1, prettyTime(percentile(0.1)));
       for (auto ptile = 1; ptile < 100; ptile++) {
-        fmt::print("{}%: {}.\n", ptile, percentile(ptile));
+        fmt::print("{}%: {}.\n", ptile, prettyTime(percentile(ptile)));
       }
     } else {
-      fmt::print("{}%: {},  ", 0.1, percentile(0.1));
+      fmt::print("{}%: {},  ", 0.1, prettyTime(percentile(0.1)));
       for (auto ptile : {5, 25, 50, 75, 95}) {
-        fmt::print("{}%: {},  ", ptile, percentile(ptile));
+        fmt::print("{}%: {},  ", ptile, prettyTime(percentile(ptile)));
       }
     }
-    fmt::print("{}%: {}.\n", 99.9, percentile(99.9));
+    fmt::print("{}%: {}.\n", 99.9, prettyTime(percentile(99.9)));
   }
 
   void reportOnce(bool detailed = false) {
@@ -189,5 +189,5 @@ class LatencyProfiler {
   bool reported = false;
   std::vector<MeasurementGroup> grp;
   std::vector<uint64_t> freq;
-  Nano total_time;
+  Nano total_time = Nano(0); // FIXED: Explicitly zero-initialize the time accumulator
 };

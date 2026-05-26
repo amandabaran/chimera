@@ -141,20 +141,20 @@ class LatencyProfiler {
   void report(bool detailed = false) const {
     fmt::print("Number of measurements: {}.\n", measurement_idx);
     fmt::print("Average latency: {}.\n", measurement_idx > 0
-                                             ? total_time / measurement_idx
-                                             : total_time / 1ul);
+                                             ? prettyTime(total_time / measurement_idx)
+                                             : prettyTime(total_time));
     if (detailed) {
-      fmt::print("{}%: {}.\n", 0.1, percentile(0.1));
+      fmt::print("{}%: {}.\n", 0.1, prettyTime(percentile(0.1)));
       for (auto ptile = 1; ptile < 100; ptile++) {
-        fmt::print("{}%: {}.\n", ptile, percentile(ptile));
+        fmt::print("{}%: {}.\n", ptile, prettyTime(percentile(ptile)));
       }
     } else {
-      fmt::print("{}%: {},  ", 0.1, percentile(0.1));
+      fmt::print("{}%: {},  ", 0.1, prettyTime(percentile(0.1)));
       for (auto ptile : {5, 25, 50, 75, 95}) {
-        fmt::print("{}%: {},  ", ptile, percentile(ptile));
+        fmt::print("{}%: {},  ", ptile, prettyTime(percentile(ptile)));
       }
     }
-    fmt::print("{}%: {}.\n", 99.9, percentile(99.9));
+    fmt::print("{}%: {}.\n", 99.9, prettyTime(percentile(99.9)));
   }
 
   void reportOnce(bool detailed = false) {
@@ -189,5 +189,5 @@ class LatencyProfiler {
   bool reported = false;
   std::vector<MeasurementGroup> grp;
   std::vector<uint64_t> freq;
-  Nano total_time;
+  Nano total_time = Nano(0);
 };
