@@ -277,13 +277,10 @@ int main(int argc, char** argv) {
             for (size_t kvIndex = 0; kvIndex < inserts.size(); kvIndex++) {
                 client.finishAllFutures();
                 
-                // 1. Strict implicit key indexing bound to array size
                 uint64_t target_reg = std::stoull(inserts[kvIndex].first.substr(4)) % layout.num_registers;
                 
-                // 2. Safe extraction/fallback to generate a valid 32-bit integer value
                 uint32_t numeric_value = 0;
                 try {
-                    // Strip non-digits from YCSB field string if possible
                     std::string val_str = inserts[kvIndex].second;
                     val_str.erase(std::remove_if(val_str.begin(), val_str.end(), 
                                   [](char c) { return !std::isdigit(c); }), val_str.end());
@@ -297,7 +294,6 @@ int main(int argc, char** argv) {
                     numeric_value = static_cast<uint32_t>(pseudo_hash(inserts[kvIndex].second) & 0xFFFFFFFF);
                 }
                 
-                // 3. Write data directly to the valid implicit index slot
                 client.getFreeFuture().doPut(target_reg, numeric_value, false);
             }
             client.finishAllFutures();
@@ -309,13 +305,14 @@ int main(int argc, char** argv) {
 
         struct ChimeraOp {
             OpType type;
-            std::string key;
-            std::string value; 
-            uint64_t scan_count; // Changed to uint64_t to resolve -Werror sign-compare
+            uint64_t target_reg;  // Pre-calculated target key index
+            uint32_t value;       // Pre-calculated 32-bit parsed update value
+            uint32_t scan_count;  // Pre-calculated range bounds
+            size_t hkey;          // Cached hash value for layout hazard checks
         };
 
         std::cout << "Querying YCSB for the list of operations... " << std::flush;
-        std::vector<ChimeraOp> operations = {}; // Explicitly typed vector
+        std::vector<ChimeraOp> operations = {}; 
 
         {
             auto fp = exec(ycsb_path + " run basic -P " + workload + " -s 2> /dev/null");
@@ -327,7 +324,10 @@ int main(int argc, char** argv) {
                     auto keyend = line.find(" [", keystart);
                     auto key = line.substr(keystart, keyend - keystart);
 
-                    operations.push_back({OpType::READ, key, "", 0});
+                    uint64_t target_reg = std::stoull(key.substr(4)) % layout.num_registers;
+                    size_t hkey = pseudo_hash(key);
+                    operations.push_back({OpType::READ, target_reg, 0, 0, hkey});
+
                 } else if (!(std::strncmp("UPDATE ", line.c_str(), 7))) {
                     auto keystart = std::string("UPDATE usertable ").length();
                     auto keyend = line.find(" [", keystart);
@@ -337,7 +337,25 @@ int main(int argc, char** argv) {
                     auto end = line.length() - std::string(" ]\n").length();
                     auto value = line.substr(start, end - start);
 
-                    operations.push_back({OpType::UPDATE, key, value, 0});
+                    uint64_t target_reg = std::stoull(key.substr(4)) % layout.num_registers;
+                    size_t hkey = pseudo_hash(key);
+
+                    uint32_t update_val = 0;
+                    try {
+                        std::string val_str = value;
+                        val_str.erase(std::remove_if(val_str.begin(), val_str.end(), 
+                                      [](char c) { return !std::isdigit(c); }), val_str.end());
+                        if (!val_str.empty()) {
+                            update_val = static_cast<uint32_t>(std::stoull(val_str) & 0xFFFFFFFF);
+                        } else {
+                            update_val = static_cast<uint32_t>(pseudo_hash(value) & 0xFFFFFFFF);
+                        }
+                    } catch (...) {
+                        update_val = static_cast<uint32_t>(pseudo_hash(value) & 0xFFFFFFFF);
+                    }
+
+                    operations.push_back({OpType::UPDATE, target_reg, update_val, 0, hkey});
+
                 } else if (!(std::strncmp("SCAN ", line.c_str(), 5))) {
                     auto keystart = std::string("SCAN usertable ").length();
                     auto keyend = line.find(" ", keystart);
@@ -345,13 +363,16 @@ int main(int argc, char** argv) {
                     
                     auto countstart = keyend + 1;
                     auto countend = line.find(" [", countstart);
-                    uint64_t count = std::stoull(line.substr(countstart, countend - countstart));
+                    uint32_t count = static_cast<uint32_t>(std::stoull(line.substr(countstart, countend - countstart)) & 0xFFFFFFFF);
 
-                    operations.push_back({OpType::SCAN, key, "", count});
+                    uint64_t target_reg = std::stoull(key.substr(4)) % layout.num_registers;
+                    size_t hkey = pseudo_hash(key);
+
+                    operations.push_back({OpType::SCAN, target_reg, 0, count, hkey});
                 }
             }
         }
-        std::cout << "Done." << std::endl;
+        std::cout << "Done. Parsed " << operations.size() << " operations." << std::endl;
 
         std::cout << "Waiting for the initialization of other clients... " << std::flush;
         ce.announceReady(store, "qp", "initialized");
@@ -365,15 +386,15 @@ int main(int argc, char** argv) {
         bool measuring = false;
         size_t skipped = 0;
 
-        // ─── MAIN BENCHMARK LOOP ────────────────────────────────────────────
+        // ─── MAIN BENCHMARK LOOP (OPTIMIZED) ────────────────────────────────
         for (size_t i = 0; i < total_iter_count; i++) {
             
             retry_next_key:
             auto& op = operations[(i + skipped) % operations.size()];
 
-            // Duplicate Swarm-KV logic checking ongoing pipeline slots for hash conflicts
+            // Concurrent pipeline hazard tracking
             if (layout.async_parallelism > 1) {
-                size_t hkey = pseudo_hash(op.key);
+                size_t hkey = op.hkey; // Read directly from optimized struct layout
                 // (Keep any custom pipeline hazard tracking logic from your original build here)
             }
 
@@ -387,45 +408,25 @@ int main(int argc, char** argv) {
                 end_time = std::chrono::steady_clock::now();
             }
 
-            // Convert alphanumeric YCSB key to implicit array index mapping
-            uint64_t target_reg = std::stoull(op.key.substr(4)) % layout.num_registers;
-
             if (op.type == OpType::UPDATE) {
-                // Parse or hash the update value into a strict 32-bit int payload
-                uint32_t update_val = 0;
-                try {
-                    std::string val_str = op.value;
-                    val_str.erase(std::remove_if(val_str.begin(), val_str.end(), 
-                                  [](char c) { return !std::isdigit(c); }), val_str.end());
-                    
-                    if (!val_str.empty()) {
-                        update_val = static_cast<uint32_t>(std::stoull(val_str) & 0xFFFFFFFF);
-                    } else {
-                        update_val = static_cast<uint32_t>(pseudo_hash(op.value) & 0xFFFFFFFF);
-                    }
-                } catch (...) {
-                    update_val = static_cast<uint32_t>(pseudo_hash(op.value) & 0xFFFFFFFF);
-                }
-
-                future.doPut(target_reg, update_val, measuring);
+                future.doPut(op.target_reg, op.value, measuring);
             } 
             else if (op.type == OpType::READ) {
-                future.doGet(target_reg, measuring);
+                future.doGet(op.target_reg, measuring);
             } 
             else if (op.type == OpType::SCAN) {
                 uint64_t valid_count = op.scan_count;
-                // Double check layout boundaries for implicit linear scanning range
-                if (target_reg + valid_count > layout.num_registers) {
-                    valid_count = layout.num_registers - target_reg;
+                if (op.target_reg + valid_count > layout.num_registers) {
+                    valid_count = layout.num_registers - op.target_reg;
                 }
                 if (valid_count > layout.max_range) {
                     valid_count = layout.max_range;
                 }
                 
                 if (valid_count > 0) {
-                    future.doRange(target_reg, static_cast<uint32_t>(valid_count), measuring);
+                    future.doRange(op.target_reg, static_cast<uint32_t>(valid_count), measuring);
                 } else {
-                    future.doGet(target_reg, measuring);
+                    future.doGet(op.target_reg, measuring);
                 }
             }
             client.getState().ops_completed++;
