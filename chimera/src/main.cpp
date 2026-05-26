@@ -277,9 +277,28 @@ int main(int argc, char** argv) {
             for (size_t kvIndex = 0; kvIndex < inserts.size(); kvIndex++) {
                 client.finishAllFutures();
                 
-                // Extract numerical representation of key string for Chimera's register mapping
+                // 1. Strict implicit key indexing bound to array size
                 uint64_t target_reg = std::stoull(inserts[kvIndex].first.substr(4)) % layout.num_registers;
-                client.getFreeFuture().doPut(target_reg, 69, false);
+                
+                // 2. Safe extraction/fallback to generate a valid 32-bit integer value
+                uint32_t numeric_value = 0;
+                try {
+                    // Strip non-digits from YCSB field string if possible
+                    std::string val_str = inserts[kvIndex].second;
+                    val_str.erase(std::remove_if(val_str.begin(), val_str.end(), 
+                                  [](char c) { return !std::isdigit(c); }), val_str.end());
+                    
+                    if (!val_str.empty()) {
+                        numeric_value = static_cast<uint32_t>(std::stoull(val_str) & 0xFFFFFFFF);
+                    } else {
+                        numeric_value = static_cast<uint32_t>(pseudo_hash(inserts[kvIndex].second) & 0xFFFFFFFF);
+                    }
+                } catch (...) {
+                    numeric_value = static_cast<uint32_t>(pseudo_hash(inserts[kvIndex].second) & 0xFFFFFFFF);
+                }
+                
+                // 3. Write data directly to the valid implicit index slot
+                client.getFreeFuture().doPut(target_reg, numeric_value, false);
             }
             client.finishAllFutures();
             std::cout << " Done." << std::endl;
@@ -368,17 +387,34 @@ int main(int argc, char** argv) {
                 end_time = std::chrono::steady_clock::now();
             }
 
-            // Convert alphanumeric YCSB key (e.g. "user23490") to integer bounds mapping
+            // Convert alphanumeric YCSB key to implicit array index mapping
             uint64_t target_reg = std::stoull(op.key.substr(4)) % layout.num_registers;
 
             if (op.type == OpType::UPDATE) {
-                future.doPut(target_reg, 69, measuring);
+                // Parse or hash the update value into a strict 32-bit int payload
+                uint32_t update_val = 0;
+                try {
+                    std::string val_str = op.value;
+                    val_str.erase(std::remove_if(val_str.begin(), val_str.end(), 
+                                  [](char c) { return !std::isdigit(c); }), val_str.end());
+                    
+                    if (!val_str.empty()) {
+                        update_val = static_cast<uint32_t>(std::stoull(val_str) & 0xFFFFFFFF);
+                    } else {
+                        update_val = static_cast<uint32_t>(pseudo_hash(op.value) & 0xFFFFFFFF);
+                    }
+                } catch (...) {
+                    update_val = static_cast<uint32_t>(pseudo_hash(op.value) & 0xFFFFFFFF);
+                }
+
+                future.doPut(target_reg, update_val, measuring);
             } 
             else if (op.type == OpType::READ) {
                 future.doGet(target_reg, measuring);
             } 
             else if (op.type == OpType::SCAN) {
                 uint64_t valid_count = op.scan_count;
+                // Double check layout boundaries for implicit linear scanning range
                 if (target_reg + valid_count > layout.num_registers) {
                     valid_count = layout.num_registers - target_reg;
                 }
