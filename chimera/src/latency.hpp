@@ -5,6 +5,8 @@
 #include <cstdint>
 #include <numeric>
 #include <vector>
+#include <string>
+#include <stdexcept>
 
 #include <fmt/chrono.h>
 #include <fmt/core.h>
@@ -34,7 +36,8 @@ class LatencyProfiler {
   };
 
   LatencyProfiler() {
-    grp.emplace_back(Nano(0), Micro(1000), Nano(5));
+    // FIXED: Group 0 now terminates at 1 microsecond (1000 ns) instead of 1000 us
+    grp.emplace_back(Nano(0), Micro(1), Nano(5));    
     grp.emplace_back(Micro(1), Micro(10), Nano(10));
     grp.emplace_back(Micro(10), Micro(20), Nano(20));
     grp.emplace_back(Micro(20), Micro(50), Nano(100));
@@ -62,7 +65,6 @@ class LatencyProfiler {
     auto d = std::chrono::duration_cast<Nano>(duration);
     measurement_idx++;
     total_time += d;
-    // auto count = d.count();
 
     if (d < std::chrono::nanoseconds(0)) {
       fmt::print("!PROFILER WARNING! Duration underflow: {}\n", d);
@@ -70,7 +72,6 @@ class LatencyProfiler {
     }
 
     if (duration >= grp.back().end) {
-      // fmt::print("!PROFILER WARN! {} > max {}.\n", duration, grp.back().end);
       return;
     }
 
@@ -101,6 +102,8 @@ class LatencyProfiler {
         std::lower_bound(acc_freq.begin(), acc_freq.end(),
                          static_cast<double>(measurents_cnt) * perc / 100.0);
 
+    if (it_freq == acc_freq.end()) return grp.back().end;
+
     auto freq_idx =
         static_cast<size_t>(std::distance(acc_freq.begin(), it_freq));
 
@@ -120,22 +123,18 @@ class LatencyProfiler {
     return time + group.granularity;
   }
 
+  // FIXED: Converts higher brackets to precise floating points instead of dropping nanoseconds
   template <typename Duration>
   static std::string prettyTime(Duration const &d) {
-    if (d < Nano(1000)) {
-      Nano dd = std::chrono::duration_cast<Nano>(d);
-      return std::to_string(dd.count()) + "ns";
-    }
+    auto ns_count = static_cast<double>(std::chrono::duration_cast<Nano>(d).count());
 
-    if (d < Micro(1000)) {
-      Micro dd = std::chrono::duration_cast<Micro>(d);
-      return std::to_string(dd.count()) + "us";
+    if (ns_count < 1000.0) {
+      return fmt::format("{:.0f}ns", ns_count);
     }
-
-    /*if (d < Milli(1000))*/ {
-      Milli dd = std::chrono::duration_cast<Milli>(d);
-      return std::to_string(dd.count()) + "ms";
+    if (ns_count < 1000000.0) {
+      return fmt::format("{:.3f}us", ns_count / 1000.0); // Preserves exact sub-microsecond times
     }
+    return fmt::format("{:.3f}ms", ns_count / 1000000.0);
   }
 
   void report(bool detailed = false) const {

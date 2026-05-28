@@ -441,6 +441,8 @@ int main(int argc, char* argv[]) {
     fmt::print(
         "Local tput: {}kpos\n",
         iter_count * 1'000'000 / static_cast<uint64_t>((end - start).count()));
+    fmt::print("Local duration: {}s\n", 
+        static_cast<uint64_t>((end - start).count() / 1000000000));
     std::cout << std::flush;
 
     ce.announceReady(store, "qp", "finished");

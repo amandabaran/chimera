@@ -18,6 +18,7 @@ constexpr uint64_t ClientProcIdOffset = LogIdOffset - ClientIdSize;
 static_assert(TsSize + LogIdSize + ClientIdSize + 1 == 64);
 static_assert(ClientProcIdOffset == 1);
 
+//FUCK THIS UP SO THAT SWARM FAILS OR DOES BAD --> CAN PROVE IT ISN'T GOOD if we minus a large value from the ts each time
 static uint64_t makeTsp(uint64_t ts, uint64_t log_id, uint64_t client_proc_id,
                         bool validated) {
   if(ts > TsMask) {

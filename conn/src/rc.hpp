@@ -10,12 +10,12 @@
 namespace dory::conn {
 struct RemoteConnection {
   struct __attribute__((packed)) RemoteConnectionInfo {
-    uint16_t lid;
-    uint32_t qpn;
+    uint16_t lid; //Infiniband network routing
+    uint32_t qpn; //queue pair number (NIC mailbox ID)
 
-    uintptr_t buf_addr;
-    uint64_t buf_size;
-    uint32_t rkey;
+    uintptr_t buf_addr; // MR virtual addr
+    uint64_t buf_size; //Registered MR size 
+    uint32_t rkey;  //Crypto key for MR access
   };
 
   RemoteConnection() {

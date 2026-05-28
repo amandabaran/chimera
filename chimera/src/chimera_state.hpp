@@ -36,7 +36,6 @@ public:
     LatencyProfiler range_profiler;
 
     // ─── Counters (small, useful for sanity / debugging) ───────────
-    uint64_t ops_completed         = 0;
     uint64_t rdma_reads            = 0;
     uint64_t rdma_cas_attempts     = 0;
     uint64_t rdma_cas_failures     = 0;
@@ -104,7 +103,6 @@ public:
     // ─── Reporting (mirroring OopsState::reportStats) ──────────────
     void reportStats(bool detailed = false) {
         fmt::print("\n################ Counters:\n");
-        fmt::print("ops_completed:           {}\n", ops_completed);
         fmt::print("rdma_reads:              {}\n", rdma_reads);
         fmt::print("rdma_cas_attempts:       {}\n", rdma_cas_attempts);
         fmt::print("rdma_cas_failures:       {}\n", rdma_cas_failures);

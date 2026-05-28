@@ -75,10 +75,20 @@ int main(int argc, char** argv) {
     chimera::Layout layout;
     layout.num_clients       = 1;
     layout.num_servers       = 1;
-    layout.async_parallelism = 16;
-    layout.num_registers     = 10000;
+    layout.async_parallelism = 1;
+    layout.num_registers     = 100000;
     layout.max_range         = 10;
     layout.majority          = 0;
+    uint64_t num_clients = 1;
+    uint64_t num_servers = 1;
+    uint64_t async_parallelism = 1; // THIS IS USED IF WE START TO BATCH IN THE FUTURES, OTHERWISE JUST SET TO 1
+    uint64_t num_registers = 100000;
+    uint64_t max_range = 10;
+    uint64_t majority = 0;       // 0 = auto-compute (num_servers/2 + 1)
+
+    // Set by client at runtime after MR is allocated.
+    // (Same pattern as swarm-kv: see Layout::client_local_region)
+    uintptr_t client_local_region = 0;
 
     float rq_p = 0.0f, get_p = 0.5f, put_p = 0.5f;
     uint64_t iter_count = default_iter_count;
@@ -86,6 +96,7 @@ int main(int argc, char** argv) {
 
     std::string ycsb_path = "./YCSB/bin/ycsb.sh";
     std::string workload = "./YCSB/workloads/swarm-workloada";
+
     bool detailed = true;
 
     // ─── CLI ────────────────────────────────────────────────────────
@@ -143,6 +154,8 @@ int main(int argc, char** argv) {
 
     auto num_proc  = layout.num_clients + layout.num_servers;
     bool is_client = proc_id > layout.num_servers;
+
+    std::cout << "Experiment: << ";
 
     if (proc_id > num_proc) {
         std::cerr << "Invalid process id: " << proc_id
@@ -359,7 +372,6 @@ int main(int argc, char** argv) {
             } else {
                 future.doGet(target_reg, measuring);
             }
-            client.getState().ops_completed++;
         }
 
         client.finishAllFutures();
@@ -369,7 +381,10 @@ int main(int argc, char** argv) {
         fmt::print("Local tput: {} kops\n",
                 iter_count * 1'000'000
                 / static_cast<uint64_t>((end_time - start_time).count()));
-
+        fmt::print("Local duration: {}s\n", 
+        static_cast<uint64_t>((end_time - start_time).count() / 1000000000));
+        std::cout << std::flush;
+        
         ce.announceReady(store, "qp", "finished");
         ce.waitReadyAll(store, "qp", "finished");
         ce.unannounceReady(store, "qp", "initialized");
