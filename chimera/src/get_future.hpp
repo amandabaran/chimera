@@ -150,6 +150,8 @@ public:
             }
             case Done:
                 break;
+            default:
+                break;
         }
         return true;
     }

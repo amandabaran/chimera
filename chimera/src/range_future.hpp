@@ -59,7 +59,7 @@ public:
                 dory::conn::ReliableConnection::RdmaRead,
                 future_id,
                 dst,
-                bytes,
+                static_cast<uint32_t>(bytes),
                 Layout::remoteAddrOf(rc.remoteBuf(), start_key));
 
             ongoing_per_server[r] += 1;
@@ -106,6 +106,8 @@ public:
                 break;
             }
             case Done:
+                break;
+            default:
                 break;
         }
         return true;

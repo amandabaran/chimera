@@ -27,6 +27,7 @@
 #include "chimera_client.hpp"
 #include "op_future.hpp"
 #include "register.hpp"
+#include "range_future.hpp" // Integrated your RangeFuture class definition
 
 using namespace dory;
 using namespace dory::conn;
@@ -39,6 +40,16 @@ namespace chimera {
     bool cache_enabled = false;
     bool writeback_enabled = false;
 }
+
+enum OpType { OpGet, OpPut, OpScan };
+
+struct YcsbOp {
+    uint64_t target_reg;
+    OpType type;
+    uint64_t scan_len; // Only used if OpScan
+};
+
+std::vector<YcsbOp> operations;
 
 // A safe custom deleter struct that avoids compiler attribute mismatches
 struct PipeDeleter {
@@ -298,41 +309,58 @@ int main(int argc, char** argv) {
             client.finishAllFutures();
             std::cout << " Done." << std::endl;
         }
-
+        
         // SWARM PATTERN: Load continuous execution operations
         std::cout << "Querying YCSB for the list of operations... " << std::flush;
-        std::vector<std::pair<std::string, std::optional<std::string>>> operations = {};
 
         {
             auto fp = exec(ycsb_path + " run basic -P " + workload + " -s 2> /dev/null");
             char buffer[1024];
             while (fgets(buffer, sizeof(buffer), fp.get()) != nullptr) {
                 std::string line(buffer);
+                
                 if (!(std::strncmp("READ ", line.c_str(), 5))) {
                     auto keystart = std::string("READ usertable ").length();
                     auto keyend = line.find(" [", keystart);
                     auto key = line.substr(keystart, keyend - keystart);
 
-                    operations.emplace_back(key, std::nullopt);
-                } else if (!(std::strncmp("UPDATE ", line.c_str(), 7))) {
+                    uint64_t target_reg = std::stoull(key.substr(4)) % layout.num_registers;
+                    operations.push_back({target_reg, OpGet, 0});
+                } 
+                else if (!(std::strncmp("UPDATE ", line.c_str(), 7))) {
                     auto keystart = std::string("UPDATE usertable ").length();
                     auto keyend = line.find(" [", keystart);
                     auto key = line.substr(keystart, keyend - keystart);
 
-                    auto start = keyend + std::string(" [ field0=").length();
-                    auto end = line.length() - std::string(" ]\n").length();
-                    auto value = line.substr(start, end - start);
+                    uint64_t target_reg = std::stoull(key.substr(4)) % layout.num_registers;
+                    operations.push_back({target_reg, OpPut, 0});
+                } 
+                else if (!(std::strncmp("SCAN ", line.c_str(), 5))) {
+                    auto keystart = std::string("SCAN usertable ").length();
+                    auto keyend = line.find(" ", keystart);
+                    auto key = line.substr(keystart, keyend - keystart);
 
-                    operations.emplace_back(key, std::optional<std::string>(value));
+                    auto countstart = keyend + 1;
+                    auto countend = line.find(" [", countstart);
+                    uint64_t scan_len = std::stoull(line.substr(countstart, countend - countstart));
+
+                    uint64_t target_reg = std::stoull(key.substr(4)) % layout.num_registers;
+                    operations.push_back({target_reg, OpScan, scan_len});
                 }
             }
         }
-        std::cout << "Done." << std::endl;
+        std::cout << "Done. Packed " << operations.size() << " operations structural states." << std::endl;
 
         std::cout << "Waiting for the initialization of other clients... " << std::flush;
         ce.announceReady(store, "qp", "initialized");
         ce.waitReadyAll(store, "qp", "initialized");
         std::cout << "Done." << std::endl;
+
+        std::vector<chimera::RangeFuture> local_range_futures;
+        for (size_t f_id = 0; f_id < layout.async_parallelism; f_id++) {
+            local_range_futures.emplace_back(client.getState(), f_id);
+        }
+        size_t next_range_idx = 0;
 
         std::cout << "Running the benchmark (YCSB Swarm Engine)... " << std::endl;
 
@@ -342,19 +370,7 @@ int main(int argc, char** argv) {
         size_t skipped = 0;
 
         for (size_t i = 0; i < total_iter_count; i++) {
-            
-            retry_next_key:
-            auto& [key, value] = operations[(i + skipped) % operations.size()];
-
-            // Duplicate Swarm-KV logic checking ongoing pipeline slots for hash conflicts
-            if (layout.async_parallelism > 1) {
-                size_t hkey = pseudo_hash(key);
-                // Chimera manages futures asynchronously via internal state queues; 
-                // We enforce a clean skip pattern to prevent overlapping structural collisions.
-                // If needed, check your future tracker identifiers here.
-            }
-
-            auto& future = client.getFreeFuture();
+            auto& op = operations[(i + skipped) % operations.size()];
 
             if (i == start_measurements) {
                 measuring = true;
@@ -364,13 +380,31 @@ int main(int argc, char** argv) {
                 end_time = std::chrono::steady_clock::now();
             }
 
-            // Convert raw alphanumeric YCSB key (e.g. "user23490") to integer bounds mapping
-            uint64_t target_reg = std::stoull(key.substr(4)) % layout.num_registers;
+            switch (op.type) {
+                case OpGet: {
+                    client.getFreeFuture().doGet(op.target_reg, measuring);
+                    break;
+                }
+                case OpScan: {
+                    uint64_t len = op.scan_len;
+                    if (len > layout.max_range) len = layout.max_range;
+                    if (op.target_reg + len > layout.num_registers) len = layout.num_registers - op.target_reg;
 
-            if (value.has_value()) {
-                future.doPut(target_reg, 69, measuring);
-            } else {
-                future.doGet(target_reg, measuring);
+                    uint64_t end_reg = op.target_reg + len - 1;
+
+                    // Pull directly from our locally initialized pool
+                    auto& range_future = local_range_futures[next_range_idx];
+                    next_range_idx = (next_range_idx + 1) % layout.async_parallelism;
+                    
+                    range_future.doRange(op.target_reg, end_reg, measuring);
+                    break;
+                }
+                case OpPut: {
+                    client.getFreeFuture().doPut(op.target_reg, 69, measuring);
+                    break;
+                }
+                default:
+                    break;
             }
         }
 

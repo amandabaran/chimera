@@ -48,6 +48,8 @@ public:
             case Kind::Put:   return put_f.isDone();
             case Kind::Range: return range_f.isDone();
             case Kind::None:  return true;
+            default:
+                break;
         }
         return true;
     }
@@ -58,6 +60,8 @@ public:
             case Kind::Put:   return put_f.isMeasuring();
             case Kind::Range: return range_f.isMeasuring();
             case Kind::None:  return false;
+            default:
+                break;
         }
         return false;
     }
@@ -78,6 +82,8 @@ public:
             case Kind::Put:   put_f.addToOngoingRDMA(server_idx, n); break;
             case Kind::Range: range_f.addToOngoingRDMA(server_idx, n); break;
             case Kind::None:  break;
+            default:
+                break;
         }
     }
 
@@ -87,6 +93,8 @@ public:
             case Kind::Put:   return put_f.tryStepForward();
             case Kind::Range: return range_f.tryStepForward();
             case Kind::None:  return true;
+            default:
+                break;
         }
         return true;
     }
