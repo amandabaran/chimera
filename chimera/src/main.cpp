@@ -330,6 +330,46 @@ int main(int argc, char** argv) {
 
     if (is_client) {
         chimera::ChimeraClient client{layout, ce, proc_id};
+
+        // SWARM PATTERN: First client triggers initial data loading phase
+        if (proc_id == (layout.num_servers + 1)) {
+            std::cout << "Querying YCSB for the set of initial key-pairs... " << std::flush;
+            std::vector<std::pair<std::string, std::string>> inserts = {};
+
+            {
+                auto fp = exec(ycsb_path + " load basic -P " + workload + " -s 2> /dev/null");
+                char buffer[1024];
+                while (fgets(buffer, sizeof(buffer), fp.get()) != nullptr) {
+                    std::string line(buffer);
+                    if (std::strncmp("INSERT ", line.c_str(), 7) != 0) {
+                        continue;
+                    }
+                    auto keystart = std::string("INSERT usertable ").length();
+                    auto keyend = line.find(" [", keystart);
+                    auto key = line.substr(keystart, keyend - keystart);
+
+                    auto start = keyend + std::string(" [ field0=").length();
+                    auto end = line.length() - std::string(" ]\n").length();
+                    auto value = line.substr(start, end - start);
+
+                    inserts.emplace_back(key, value);
+                }
+            }
+            std::cout << "Done." << std::endl;
+
+            std::cout << "Inserting the initial key-pairs... " << std::flush;
+            for (size_t kvIndex = 0; kvIndex < inserts.size(); kvIndex++) {
+                client.finishAllFutures();
+                
+                // Extract numerical representation of key string for Chimera's register mapping
+                uint64_t target_reg = std::stoull(inserts[kvIndex].first.substr(4)) % layout.num_registers;
+                std::cout << "Inserting register: " << target_reg << std::endl;
+                client.getFreeFuture().doPut(target_reg, 69, false);
+            }
+            client.finishAllFutures();
+            std::cout << " Done." << std::endl;
+        }
+
         if (run_ml_workload) {
             // Trackers are assigned based on a normalized structural index 
             // sequence. If this is client #1 (proc_id == num_servers + 1), it becomes ID 0 (Tracker).
@@ -349,45 +389,6 @@ int main(int argc, char** argv) {
         } 
         else {
             std::cout << "Configuring Client " << proc_id << std::endl;
-            chimera::ChimeraClient client{layout, ce, proc_id};
-
-            // SWARM PATTERN: First client triggers initial data loading phase
-            if (proc_id == (layout.num_servers + 1)) {
-                std::cout << "Querying YCSB for the set of initial key-pairs... " << std::flush;
-                std::vector<std::pair<std::string, std::string>> inserts = {};
-
-                {
-                    auto fp = exec(ycsb_path + " load basic -P " + workload + " -s 2> /dev/null");
-                    char buffer[1024];
-                    while (fgets(buffer, sizeof(buffer), fp.get()) != nullptr) {
-                        std::string line(buffer);
-                        if (std::strncmp("INSERT ", line.c_str(), 7) != 0) {
-                            continue;
-                        }
-                        auto keystart = std::string("INSERT usertable ").length();
-                        auto keyend = line.find(" [", keystart);
-                        auto key = line.substr(keystart, keyend - keystart);
-
-                        auto start = keyend + std::string(" [ field0=").length();
-                        auto end = line.length() - std::string(" ]\n").length();
-                        auto value = line.substr(start, end - start);
-
-                        inserts.emplace_back(key, value);
-                    }
-                }
-                std::cout << "Done." << std::endl;
-
-                std::cout << "Inserting the initial key-pairs... " << std::flush;
-                for (size_t kvIndex = 0; kvIndex < inserts.size(); kvIndex++) {
-                    client.finishAllFutures();
-                    
-                    // Extract numerical representation of key string for Chimera's register mapping
-                    uint64_t target_reg = std::stoull(inserts[kvIndex].first.substr(4)) % layout.num_registers;
-                    client.getFreeFuture().doPut(target_reg, 69, false);
-                }
-                client.finishAllFutures();
-                std::cout << " Done." << std::endl;
-            }
             
             // SWARM PATTERN: Load continuous execution operations
             std::cout << "Querying YCSB for the list of operations... " << std::flush;
