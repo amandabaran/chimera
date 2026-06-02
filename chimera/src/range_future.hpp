@@ -57,7 +57,7 @@ public:
 
             rc.postSendSingle(
                 dory::conn::ReliableConnection::RdmaRead,
-                future_id,
+                future_id | (1ULL << 63),
                 dst,
                 static_cast<uint32_t>(bytes),
                 Layout::remoteAddrOf(rc.remoteBuf(), start_key));

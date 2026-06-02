@@ -61,6 +61,11 @@ struct PipeDeleter {
 // Clean forward declarations to satisfy -Wmissing-declarations
 std::unique_ptr<FILE, PipeDeleter> exec(const std::string& cmd);
 size_t pseudo_hash(const std::string& str);
+void run_ml_prog_tracker_workload(
+    chimera::ChimeraClient& client, 
+    uint64_t global_thread_id, 
+    uint64_t num_registers,
+    uint64_t ops_to_run);
 
 std::unique_ptr<FILE, PipeDeleter> exec(const std::string& cmd) {
     auto raw_pipe = popen(cmd.c_str(), "r");
@@ -79,6 +84,60 @@ size_t pseudo_hash(const std::string& str) {
     return hash;
 }
 
+void run_ml_prog_tracker_workload(
+    chimera::ChimeraClient& client, 
+    uint64_t global_thread_id, // Derived entirely from proc_id mapping
+    uint64_t num_registers,
+    uint64_t ops_to_run) 
+{
+    chimera::RangeFuture range_future(client.getState(), 0);
+
+    // --- WARMUP PHASE (5-second native spin) ---
+    auto warmup_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (std::chrono::steady_clock::now() < warmup_deadline) {
+        if (global_thread_id == 0) {
+            range_future.doRange(0, num_registers - 1, false);
+        } else {
+            client.getFreeFuture().doPut(global_thread_id % num_registers, 1, false);
+        }
+        client.finishAllFutures();
+    }
+    
+    uint64_t progress_counter = 1;
+    auto start_time = std::chrono::steady_clock::now();
+
+    // --- MAIN LOOP ---
+    for (uint64_t op_idx = 0; op_idx < ops_to_run; ++op_idx) {
+        bool measuring = (op_idx % 1000 == 0); 
+
+        if (global_thread_id == 0) {
+            // Tracker role: Aggressively scans the register grid space
+            range_future.doRange(0, num_registers - 1, measuring);
+        } else {
+            // Worker role: Regularly checkpoints progress to dedicated register spot
+            client.getFreeFuture().doPut(global_thread_id % num_registers, progress_counter++, measuring);
+        }
+        
+        // Windowed flushing behavior for pipelined asynchronous operations
+        if (op_idx % 16 == 0) {
+            client.finishAllFutures();
+        }
+    }
+    client.finishAllFutures();
+    auto end_time = std::chrono::steady_clock::now();
+
+    // Results reporting formatted for easy parsing
+    uint64_t duration_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(end_time - start_time).count();
+    double duration_sec = static_cast<double>(duration_ns) / 1'000'000'000.0;
+    double tput_kops = (static_cast<double>(ops_to_run) / 1000.0) / duration_sec;
+
+    //switch to using cout
+    std::cout << "ML-TRACKER-RESULTS: " 
+              << "thread_id=" << global_thread_id << " "
+              << "duration_sec=" << duration_sec << " "
+              << "tput_kops=" << tput_kops 
+              << std::endl;
+}
 int main(int argc, char** argv) {
     chimera::ProcId proc_id = 0;
     bool show_help = false;
@@ -104,6 +163,7 @@ int main(int argc, char** argv) {
     float rq_p = 0.0f, get_p = 0.5f, put_p = 0.5f;
     uint64_t iter_count = default_iter_count;
     uint64_t warmup     = UINT64_MAX;
+    bool run_ml_workload = false;
 
     std::string ycsb_path = "./YCSB/bin/ycsb.sh";
     std::string workload = "./YCSB/workloads/swarm-workloada";
@@ -140,7 +200,8 @@ int main(int argc, char** argv) {
         lyra::opt(chimera::cache_enabled, "cache")
             ["--cache"]("Enable or disable the Chimera cache system (1 or 0)") |
         lyra::opt(chimera::writeback_enabled, "writeback")
-            ["--writeback"]("Enable or disable writeback in CAS-ABD protocol (1 or 0)");
+            ["--writeback"]("Enable or disable writeback in CAS-ABD protocol (1 or 0)") |
+        lyra::opt(run_ml_workload, "ml").optional()["--ml"];
 
     auto result = cli.parse({argc, argv});
     if (!result || show_help ) {
@@ -213,9 +274,8 @@ int main(int argc, char** argv) {
     ctrl::ControlBlock cb(resolved_port);
     cb.registerPd("primary");
 
-    {
-        size_t allocated_size = is_client ? layout.clientSize()
-                                          : layout.serverSize();
+   {
+        size_t allocated_size = is_client ? layout.clientSize() : layout.serverSize();
         cb.allocateBuffer("shared-buf", allocated_size, 64);
     }
 
@@ -269,160 +329,179 @@ int main(int argc, char** argv) {
     ce.unannounceReady(store, "qp", "prepared");
 
     if (is_client) {
-        std::cout << "Configuring Client " << proc_id << std::endl;
         chimera::ChimeraClient client{layout, ce, proc_id};
+        if (run_ml_workload) {
+            // Trackers are assigned based on a normalized structural index 
+            // sequence. If this is client #1 (proc_id == num_servers + 1), it becomes ID 0 (Tracker).
+            uint64_t global_thread_id = proc_id - layout.num_servers - 1;
 
-        // SWARM PATTERN: First client triggers initial data loading phase
-        if (proc_id == (layout.num_servers + 1)) {
-            std::cout << "Querying YCSB for the set of initial key-pairs... " << std::flush;
-            std::vector<std::pair<std::string, std::string>> inserts = {};
+            std::cout << "Running single-threaded ML tracker workload. ID=" << global_thread_id << std::endl;
+            
+            // Sync with cluster deployment infrastructure
+            ce.announceReady(store, "qp", "initialized");
+            ce.waitReadyAll(store, "qp", "initialized");
+
+            run_ml_prog_tracker_workload(client, global_thread_id, layout.num_registers, iter_count);
+
+            ce.announceReady(store, "qp", "finished");
+            ce.waitReadyAll(store, "qp", "finished");
+            ce.unannounceReady(store, "qp", "initialized");
+        } 
+        else {
+            std::cout << "Configuring Client " << proc_id << std::endl;
+            chimera::ChimeraClient client{layout, ce, proc_id};
+
+            // SWARM PATTERN: First client triggers initial data loading phase
+            if (proc_id == (layout.num_servers + 1)) {
+                std::cout << "Querying YCSB for the set of initial key-pairs... " << std::flush;
+                std::vector<std::pair<std::string, std::string>> inserts = {};
+
+                {
+                    auto fp = exec(ycsb_path + " load basic -P " + workload + " -s 2> /dev/null");
+                    char buffer[1024];
+                    while (fgets(buffer, sizeof(buffer), fp.get()) != nullptr) {
+                        std::string line(buffer);
+                        if (std::strncmp("INSERT ", line.c_str(), 7) != 0) {
+                            continue;
+                        }
+                        auto keystart = std::string("INSERT usertable ").length();
+                        auto keyend = line.find(" [", keystart);
+                        auto key = line.substr(keystart, keyend - keystart);
+
+                        auto start = keyend + std::string(" [ field0=").length();
+                        auto end = line.length() - std::string(" ]\n").length();
+                        auto value = line.substr(start, end - start);
+
+                        inserts.emplace_back(key, value);
+                    }
+                }
+                std::cout << "Done." << std::endl;
+
+                std::cout << "Inserting the initial key-pairs... " << std::flush;
+                for (size_t kvIndex = 0; kvIndex < inserts.size(); kvIndex++) {
+                    client.finishAllFutures();
+                    
+                    // Extract numerical representation of key string for Chimera's register mapping
+                    uint64_t target_reg = std::stoull(inserts[kvIndex].first.substr(4)) % layout.num_registers;
+                    client.getFreeFuture().doPut(target_reg, 69, false);
+                }
+                client.finishAllFutures();
+                std::cout << " Done." << std::endl;
+            }
+            
+            // SWARM PATTERN: Load continuous execution operations
+            std::cout << "Querying YCSB for the list of operations... " << std::flush;
 
             {
-                auto fp = exec(ycsb_path + " load basic -P " + workload + " -s 2> /dev/null");
+                auto fp = exec(ycsb_path + " run basic -P " + workload + " -s 2> /dev/null");
                 char buffer[1024];
                 while (fgets(buffer, sizeof(buffer), fp.get()) != nullptr) {
                     std::string line(buffer);
-                    if (std::strncmp("INSERT ", line.c_str(), 7) != 0) {
-                        continue;
+                    
+                    if (!(std::strncmp("READ ", line.c_str(), 5))) {
+                        auto keystart = std::string("READ usertable ").length();
+                        auto keyend = line.find(" [", keystart);
+                        auto key = line.substr(keystart, keyend - keystart);
+
+                        uint64_t target_reg = std::stoull(key.substr(4)) % layout.num_registers;
+                        operations.push_back({target_reg, OpGet, 0});
+                    } 
+                    else if (!(std::strncmp("UPDATE ", line.c_str(), 7))) {
+                        auto keystart = std::string("UPDATE usertable ").length();
+                        auto keyend = line.find(" [", keystart);
+                        auto key = line.substr(keystart, keyend - keystart);
+
+                        uint64_t target_reg = std::stoull(key.substr(4)) % layout.num_registers;
+                        operations.push_back({target_reg, OpPut, 0});
+                    } 
+                    else if (!(std::strncmp("SCAN ", line.c_str(), 5))) {
+                        auto keystart = std::string("SCAN usertable ").length();
+                        auto keyend = line.find(" ", keystart);
+                        auto key = line.substr(keystart, keyend - keystart);
+
+                        auto countstart = keyend + 1;
+                        auto countend = line.find(" [", countstart);
+                        uint64_t scan_len = std::stoull(line.substr(countstart, countend - countstart));
+
+                        uint64_t target_reg = std::stoull(key.substr(4)) % layout.num_registers;
+                        operations.push_back({target_reg, OpScan, scan_len});
                     }
-                    auto keystart = std::string("INSERT usertable ").length();
-                    auto keyend = line.find(" [", keystart);
-                    auto key = line.substr(keystart, keyend - keystart);
-
-                    auto start = keyend + std::string(" [ field0=").length();
-                    auto end = line.length() - std::string(" ]\n").length();
-                    auto value = line.substr(start, end - start);
-
-                    inserts.emplace_back(key, value);
                 }
             }
+            std::cout << "Done. Packed " << operations.size() << " operations structural states." << std::endl;
+
+            std::cout << "Waiting for the initialization of other clients... " << std::flush;
+            ce.announceReady(store, "qp", "initialized");
+            ce.waitReadyAll(store, "qp", "initialized");
             std::cout << "Done." << std::endl;
 
-            std::cout << "Inserting the initial key-pairs... " << std::flush;
-            for (size_t kvIndex = 0; kvIndex < inserts.size(); kvIndex++) {
-                client.finishAllFutures();
-                
-                // Extract numerical representation of key string for Chimera's register mapping
-                uint64_t target_reg = std::stoull(inserts[kvIndex].first.substr(4)) % layout.num_registers;
-                client.getFreeFuture().doPut(target_reg, 69, false);
+            std::vector<chimera::RangeFuture> local_range_futures;
+            for (size_t f_id = 0; f_id < layout.async_parallelism; f_id++) {
+                local_range_futures.emplace_back(client.getState(), f_id);
             }
+            size_t next_range_idx = 0;
+
+            std::cout << "Running the benchmark (YCSB Swarm Engine)... " << std::endl;
+
+            std::chrono::steady_clock::time_point start_time;
+            std::chrono::steady_clock::time_point end_time;
+            bool measuring = false;
+            size_t skipped = 0;
+
+            for (size_t i = 0; i < total_iter_count; i++) {
+                auto& op = operations[(i + skipped) % operations.size()];
+
+                if (i == start_measurements) {
+                    measuring = true;
+                    start_time = std::chrono::steady_clock::now();
+                } else if (i == stop_measurements) {
+                    measuring = false;
+                    end_time = std::chrono::steady_clock::now();
+                }
+
+                switch (op.type) {
+                    case OpGet: {
+                        client.getFreeFuture().doGet(op.target_reg, measuring);
+                        break;
+                    }
+                    case OpScan: {
+                        uint64_t len = op.scan_len;
+                        if (len > layout.max_range) len = layout.max_range;
+                        if (op.target_reg + len > layout.num_registers) len = layout.num_registers - op.target_reg;
+
+                        uint64_t end_reg = op.target_reg + len - 1;
+
+                        // Pull directly from our locally initialized pool
+                        auto& range_future = local_range_futures[next_range_idx];
+                        next_range_idx = (next_range_idx + 1) % layout.async_parallelism;
+                        
+                        range_future.doRange(op.target_reg, end_reg, measuring);
+                        break;
+                    }
+                    case OpPut: {
+                        client.getFreeFuture().doPut(op.target_reg, 69, measuring);
+                        break;
+                    }
+                    default:
+                        break;
+                }
+            }
+
             client.finishAllFutures();
-            std::cout << " Done." << std::endl;
+            std::cout << "Done. Results:" << std::endl;
+
+            client.reportStats(detailed);
+            fmt::print("Local tput: {} kops\n",
+                    iter_count * 1'000'000
+                    / static_cast<uint64_t>((end_time - start_time).count()));
+            fmt::print("Local duration: {}s\n", 
+            static_cast<uint64_t>((end_time - start_time).count() / 1000000000));
+            std::cout << std::flush;
+            
+            ce.announceReady(store, "qp", "finished");
+            ce.waitReadyAll(store, "qp", "finished");
+            ce.unannounceReady(store, "qp", "initialized");
         }
-        
-        // SWARM PATTERN: Load continuous execution operations
-        std::cout << "Querying YCSB for the list of operations... " << std::flush;
-
-        {
-            auto fp = exec(ycsb_path + " run basic -P " + workload + " -s 2> /dev/null");
-            char buffer[1024];
-            while (fgets(buffer, sizeof(buffer), fp.get()) != nullptr) {
-                std::string line(buffer);
-                
-                if (!(std::strncmp("READ ", line.c_str(), 5))) {
-                    auto keystart = std::string("READ usertable ").length();
-                    auto keyend = line.find(" [", keystart);
-                    auto key = line.substr(keystart, keyend - keystart);
-
-                    uint64_t target_reg = std::stoull(key.substr(4)) % layout.num_registers;
-                    operations.push_back({target_reg, OpGet, 0});
-                } 
-                else if (!(std::strncmp("UPDATE ", line.c_str(), 7))) {
-                    auto keystart = std::string("UPDATE usertable ").length();
-                    auto keyend = line.find(" [", keystart);
-                    auto key = line.substr(keystart, keyend - keystart);
-
-                    uint64_t target_reg = std::stoull(key.substr(4)) % layout.num_registers;
-                    operations.push_back({target_reg, OpPut, 0});
-                } 
-                else if (!(std::strncmp("SCAN ", line.c_str(), 5))) {
-                    auto keystart = std::string("SCAN usertable ").length();
-                    auto keyend = line.find(" ", keystart);
-                    auto key = line.substr(keystart, keyend - keystart);
-
-                    auto countstart = keyend + 1;
-                    auto countend = line.find(" [", countstart);
-                    uint64_t scan_len = std::stoull(line.substr(countstart, countend - countstart));
-
-                    uint64_t target_reg = std::stoull(key.substr(4)) % layout.num_registers;
-                    operations.push_back({target_reg, OpScan, scan_len});
-                }
-            }
-        }
-        std::cout << "Done. Packed " << operations.size() << " operations structural states." << std::endl;
-
-        std::cout << "Waiting for the initialization of other clients... " << std::flush;
-        ce.announceReady(store, "qp", "initialized");
-        ce.waitReadyAll(store, "qp", "initialized");
-        std::cout << "Done." << std::endl;
-
-        std::vector<chimera::RangeFuture> local_range_futures;
-        for (size_t f_id = 0; f_id < layout.async_parallelism; f_id++) {
-            local_range_futures.emplace_back(client.getState(), f_id);
-        }
-        size_t next_range_idx = 0;
-
-        std::cout << "Running the benchmark (YCSB Swarm Engine)... " << std::endl;
-
-        std::chrono::steady_clock::time_point start_time;
-        std::chrono::steady_clock::time_point end_time;
-        bool measuring = false;
-        size_t skipped = 0;
-
-        for (size_t i = 0; i < total_iter_count; i++) {
-            auto& op = operations[(i + skipped) % operations.size()];
-
-            if (i == start_measurements) {
-                measuring = true;
-                start_time = std::chrono::steady_clock::now();
-            } else if (i == stop_measurements) {
-                measuring = false;
-                end_time = std::chrono::steady_clock::now();
-            }
-
-            switch (op.type) {
-                case OpGet: {
-                    client.getFreeFuture().doGet(op.target_reg, measuring);
-                    break;
-                }
-                case OpScan: {
-                    uint64_t len = op.scan_len;
-                    if (len > layout.max_range) len = layout.max_range;
-                    if (op.target_reg + len > layout.num_registers) len = layout.num_registers - op.target_reg;
-
-                    uint64_t end_reg = op.target_reg + len - 1;
-
-                    // Pull directly from our locally initialized pool
-                    auto& range_future = local_range_futures[next_range_idx];
-                    next_range_idx = (next_range_idx + 1) % layout.async_parallelism;
-                    
-                    range_future.doRange(op.target_reg, end_reg, measuring);
-                    break;
-                }
-                case OpPut: {
-                    client.getFreeFuture().doPut(op.target_reg, 69, measuring);
-                    break;
-                }
-                default:
-                    break;
-            }
-        }
-
-        client.finishAllFutures();
-        std::cout << "Done. Results:" << std::endl;
-
-        client.reportStats(detailed);
-        fmt::print("Local tput: {} kops\n",
-                iter_count * 1'000'000
-                / static_cast<uint64_t>((end_time - start_time).count()));
-        fmt::print("Local duration: {}s\n", 
-        static_cast<uint64_t>((end_time - start_time).count() / 1000000000));
-        std::cout << std::flush;
-        
-        ce.announceReady(store, "qp", "finished");
-        ce.waitReadyAll(store, "qp", "finished");
-        ce.unannounceReady(store, "qp", "initialized");
-
     } else {
         std::cout << "Server " << proc_id << " online." << std::endl;
         ce.announceReady(store, "qp", "initialized");
