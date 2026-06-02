@@ -357,21 +357,6 @@ int main(int argc, char* argv[]) {
 
     std::cout << "Done." << std::endl;
 
-   std::cout << "\n=== Parsed YCSB Operations (First 20 items) ===\n";
-    size_t print_limit = std::min(operations.size(), size_t(20)); 
-    for (size_t i = 0; i < print_limit; i++) {
-      auto& op = operations[i]; // Grab the struct reference directly
-      
-      if (op.type == OpType::UPDATE) {
-        std::cout << fmt::format("[OpType: UPDATE] -> Key: '{}', Value: '{}'\n", op.key, op.value);
-      } else if (op.type == OpType::READ) {
-        std::cout << fmt::format("[OpType: READ  ] -> Key: '{}'\n", op.key);
-      } else if (op.type == OpType::SCAN) {
-        std::cout << fmt::format("[OpType: SCAN  ] -> Key: '{}', Count: {}\n", op.key, op.scan_count);
-      }
-    }
-    std::cout << "===============================================\n\n";
-
     std::cout << "Waiting for the initialization of other clients... "
               << std::flush;
 
