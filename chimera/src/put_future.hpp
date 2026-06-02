@@ -15,7 +15,7 @@ class PutFuture : public BasicFuture {
 public:
     enum Step {
         ReadSeq,         // Phase 1 (cache miss path): read all replicas
-        OptimisticChain, // Cache-hit path: doorbell-batched READ+CAS chain
+        OptimisticCAS,   // Optimized cache-hit path: direct single CAS using cached guess
         CAS,             // Phase 2: CAS retries
         Done
     };
@@ -56,43 +56,19 @@ private:
         }
     }
 
-    // ─── Optimistic path: doorbell-chained READ + CAS per server ─────
-    //
-    // wr[0] = RDMA READ  (unsignaled) → fills read_bufs[r] for fallback
-    // wr[1] = ATOMIC CAS (signaled)   → tries to install target_reg using
-    //                                    the cached expected value
-    //
-    // 1 doorbell, 1 CQE per server.  If the CAS succeeds, we're done in
-    // a single RTT.  If it fails, read_bufs[r] now holds the current value
-    // and swap_bufs[r] holds it too (CAS swapback).  We fall back to
-    // the regular CAS retry phase.
-    void postOptimisticChain(size_t server_idx) {
+    // ─── Optimized Path: Single Optimistic CAS ───────────────────────
+    // No chained READ. If the CAS fails, the hardware returns the 
+    // current remote value directly into swap_bufs[server_idx].
+    void postOptimisticCas(size_t server_idx) {
         auto& rc = *state.server_conns[server_idx];
         uintptr_t remote = Layout::remoteAddrOf(rc.remoteBuf(), key);
 
-        struct ibv_send_wr wr[2];
-        struct ibv_sge     sg[2];
-
-        rc.prepareSingle(
-            wr[0], sg[0],
-            dory::conn::ReliableConnection::RdmaRead,
-            future_id,
-            &read_bufs[server_idx],
-            sizeof(Register),
-            remote,
-            /*signaled=*/false);
-
-        rc.prepareSingleCas(
-            wr[1], sg[1],
+        rc.postSendSingleCas(
             future_id,
             &swap_bufs[server_idx],
             remote,
-            expected[server_idx],   // from cache
-            target_reg.raw,
-            /*signaled=*/true);
-
-        wr[0].next = &wr[1];
-        rc.postSend(wr[0]);
+            expected[server_idx],   // Guess from cache
+            target_reg.raw);
 
         ongoing_per_server[server_idx] += 1;
         state.to_poll_per_server[server_idx] += 1;
@@ -139,8 +115,7 @@ public:
 #if CHIMERA_CACHE_ENABLED
         Register cached;
         if (state.cache.get(key, cached)) {
-            // ─── Cache-hit fast path: optimistic doorbell-batched chain ───
-            state.metrics_cache_hit();   // or your hook
+            state.metrics_cache_hit();
 
             // Build target = (cached.seq + 1, client_id, value)
             target_reg = Register(
@@ -148,28 +123,26 @@ public:
                 static_cast<uint16_t>(state.client_idx),
                 static_cast<uint32_t>(value));
 
-            // Same expected for every server — what we think the slot has
+            // Set expectations from cache
             for (size_t i = 0; i < state.layout.num_servers; ++i) {
                 expected[i] = cached.raw;
             }
             for (size_t i = 0; i < state.quorum; ++i) {
                 size_t r = state.quorum_indices[i];
                 needs_cas[r] = true;
-                postOptimisticChain(r);
+                postOptimisticCas(r);
             }
-            step = OptimisticChain;
+            step = OptimisticCAS;
             return;
         }
         state.metrics_cache_miss();
 #endif
 
-        // ─── Cache-miss path: original two-phase READ + CAS ──────────
         postReads();
         step = ReadSeq;
     }
 
     bool isDone() const { return step == Done; }
-
     timepoint getStart() const { return start; }
     bool isMeasuring() const { return measuring; }
 
@@ -177,11 +150,10 @@ public:
         ongoing_per_server[server_idx] += n;
     }
 
-     bool tryStepForward() {
+    bool tryStepForward() {
         for (auto x : ongoing_per_server) if (x > 0) return false;
 
         switch (step) {
-            // ─── Phase 1 of cache-miss path ─────────────────────────
             case ReadSeq: {
                 uint16_t z_max = 0;
                 for (size_t i = 0; i < state.quorum; ++i) {
@@ -201,37 +173,31 @@ public:
                 break;
             }
 
-            // ─── Optimistic chain completed ─────────────────────────
-            case OptimisticChain: {
-                // For each server: did the CAS succeed?
-                //   Yes → swap_bufs[r].raw == expected[r] (the cached value)
-                //   No  → swap_bufs[r].raw  = actual current value at that slot
-                //         (read_bufs[r] holds the same; it's a free check)
-                uint16_t z_max = target_reg.fields.seq - 1;  // start at our base
+            // ─── Optimized Optimistic CAS Execution ──────────────────
+            case OptimisticCAS: {
+                uint16_t z_max = target_reg.fields.seq - 1; 
                 bool any_failed = false;
 
                 for (size_t i = 0; i < state.quorum; ++i) {
                     size_t r = state.quorum_indices[i];
                     Register observed = swap_bufs[r];
-                    state.countRead();   // chained READ also counts
 
                     if (observed.raw == expected[r]) {
-                        // Optimistic CAS succeeded
+                        // CAS Succeeded! The remote slot matched our cached guess.
                         needs_cas[r] = false;
                         success_count++;
                     } else {
-                        // CAS failed — observed is the real current value
+                        // CAS Failed. The HCA automatically returned the true,
+                        // current remote slot data inside 'observed'.
                         state.countCasFail();
                         any_failed = true;
-                        // Re-key expected[] to per-quorum-slot indexing for Phase 2
-                        // (Note: in optimistic path we used expected[r] keyed by server.
-                        //  We rewrite to expected[i] keyed by quorum-slot here.)
-                        expected[i] = observed.raw;
+                        
+                        expected[i] = observed.raw; // Safe for Phase 2 retries
                         z_max = std::max(z_max, observed.fields.seq);
                     }
                 }
 
-                // Also normalize succeeded entries' expected[i] to quorum-slot keying
+                // Normalize success tracks
                 for (size_t i = 0; i < state.quorum; ++i) {
                     size_t r = state.quorum_indices[i];
                     if (!needs_cas[r]) {
@@ -250,8 +216,7 @@ public:
                     break;
                 }
 
-                // Some optimistic CASes failed.  Bump our seq above the highest
-                // observed and retry only the laggards.
+                // Fallback: Increment version sequence over largest observed state
                 state.put_retries++;
                 target_reg = Register(
                     static_cast<uint16_t>(z_max + 1),
@@ -263,7 +228,6 @@ public:
                 break;
             }
 
-            // ─── Phase 2: CAS retry loop ────────────────────────────
             case CAS: {
                 bool any_failed = false;
 
@@ -273,7 +237,6 @@ public:
 
                     Register observed = swap_bufs[r];
                     if (observed.raw == expected[i]) {
-                        // CAS succeeded
                         needs_cas[r] = false;
                         success_count++;
                     } else {
@@ -281,19 +244,15 @@ public:
                         any_failed = true;
                         expected[i] = observed.raw;
 
-                        // If observed has higher-or-equal seq than our target,
-                        // bump our seq above it and reset every replica's CAS.
                         if (observed.fields.seq >= target_reg.fields.seq) {
                             target_reg = Register(
                                 static_cast<uint16_t>(observed.fields.seq + 1),
                                 static_cast<uint16_t>(state.client_idx),
                                 static_cast<uint32_t>(value));
-                            // Previously-succeeded replicas now have a stale
-                            // value too — redo all of them.
                             for (size_t j = 0; j < state.quorum; ++j) {
                                 size_t rj = state.quorum_indices[j];
                                 needs_cas[rj] = true;
-                                expected[j] = read_bufs[rj].raw;  // best known
+                                expected[j] = swap_bufs[rj].raw; // Fallback read data safely from prior CAS results
                             }
                             success_count = 0;
                         }
@@ -311,7 +270,6 @@ public:
                 } else {
                     state.put_retries++;
                     postCas();
-                    // step stays CAS
                 }
                 break;
             }

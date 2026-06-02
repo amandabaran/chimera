@@ -368,7 +368,7 @@ int main(int argc, char** argv) {
             uint64_t target_reg = std::stoull(key.substr(4)) % layout.num_registers;
 
             if (value.has_value()) {
-                future.doPut(target_reg, 69, measuring);
+                future.doPutPerf(target_reg, 69, chimera::RAW_WRITE, measuring);
             } else {
                 future.doGet(target_reg, measuring);
             }
