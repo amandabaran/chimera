@@ -55,13 +55,15 @@ public:
                  dory::conn::RcConnectionExchanger<ProcId>& rcx,
                  ProcId _proc_id)
         : layout{_layout},
-          proc_id{_proc_id},
-          client_idx{static_cast<uint8_t>(_proc_id - layout.firstClientId())}
+          proc_id{_proc_id}
         #if CHIMERA_CACHE_ENABLED
-          ,cache{layout.num_registers}
+          ,cache{_layout.num_registers}
         #endif 
     {
+        // 1. Compute client_idx explicitly from incoming parameter block to avoid initialization-order bugs
+        client_idx = static_cast<uint8_t>(_proc_id - _layout.firstClientId());
 
+        // 2. Compute majority thresholds safely
         if (layout.majority == 0) {
             layout.majority = layout.num_servers / 2 + 1;
         }
@@ -74,6 +76,7 @@ public:
         to_poll_per_server.assign(layout.num_servers, 0);
         wces.resize(128);
 
+        quorum_indices.clear();
         quorum_indices.reserve(quorum);
         for (size_t i = 0; i < quorum; ++i) {
             quorum_indices.push_back((client_idx + i) % layout.num_servers);

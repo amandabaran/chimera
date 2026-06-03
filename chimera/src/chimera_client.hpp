@@ -80,24 +80,16 @@ public:
             auto& tp = state.to_poll_per_server[s];
             if (tp == 0) continue;
 
-            // Maintain a fixed upper-bound capacity window for your worker layer
+            // Set maximum burst capacity step for the hardware poll step
             state.wces.resize(128); 
 
-            // Adapt this line if your wrapper returns the integer count directly, 
-            // otherwise use a direct ibv_poll_cq lookalike structure
+            // Dory shrinks state.wces.size() inside this function to match the real event count
             if (!rc.pollCqIsOk(dory::conn::ReliableConnection::SendCq, state.wces)) {
                 throw std::runtime_error("Error polling CQ");
             }
 
-            // If Dory does not shrink the vector size dynamically to match real events, 
-            // ensure you are only iterating over elements where wc.status is active.
-            size_t actual_completions = 0;
+            // Loop strictly over entries reaped by Dory
             for (auto const& wc : state.wces) {
-                // Guard check to handle empty backend slots in unfilled buffers
-                if (wc.wr_id == 0 && wc.status == 0) break; 
-                
-                actual_completions++;
-
                 if (wc.status != IBV_WC_SUCCESS) {
                     throw std::runtime_error("WC unsuccessful");
                 }
@@ -116,8 +108,8 @@ public:
                 any_progress = true;
             }
             
-            // Safe, accurate tracking window decrement
-            tp -= static_cast<int64_t>(actual_completions);
+            // Safe decrement using Dory's clean post-poll vector size
+            tp -= static_cast<int64_t>(state.wces.size());
         }
         return any_progress;
     }

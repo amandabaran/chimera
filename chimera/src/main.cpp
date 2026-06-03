@@ -363,7 +363,7 @@ int main(int argc, char** argv) {
                 
                 // Extract numerical representation of key string for Chimera's register mapping
                 uint64_t target_reg = std::stoull(inserts[kvIndex].first.substr(4)) % layout.num_registers;
-                std::cout << "Inserting register: " << target_reg << std::endl;
+                // std::cout << "Inserting register: " << target_reg << std::endl;
                 client.getFreeFuture().doPut(target_reg, 69, false);
             }
             client.finishAllFutures();
@@ -436,12 +436,6 @@ int main(int argc, char** argv) {
             ce.waitReadyAll(store, "qp", "initialized");
             std::cout << "Done." << std::endl;
 
-            std::vector<chimera::RangeFuture> local_range_futures;
-            for (size_t f_id = 0; f_id < layout.async_parallelism; f_id++) {
-                local_range_futures.emplace_back(client.getState(), f_id);
-            }
-            size_t next_range_idx = 0;
-
             std::cout << "Running the benchmark (YCSB Swarm Engine)... " << std::endl;
 
             std::chrono::steady_clock::time_point start_time;
@@ -471,12 +465,7 @@ int main(int argc, char** argv) {
                         if (op.target_reg + len > layout.num_registers) len = layout.num_registers - op.target_reg;
 
                         uint64_t end_reg = op.target_reg + len - 1;
-
-                        // Pull directly from our locally initialized pool
-                        auto& range_future = local_range_futures[next_range_idx];
-                        next_range_idx = (next_range_idx + 1) % layout.async_parallelism;
-                        
-                        range_future.doRange(op.target_reg, end_reg, measuring);
+                        client.getFreeRangeFuture().doRange(op.target_reg, end_reg, measuring);
                         break;
                     }
                     case OpPut: {
