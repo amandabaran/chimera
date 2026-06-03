@@ -149,12 +149,6 @@ int main(int argc, char** argv) {
     layout.num_registers     = 100000;
     layout.max_range         = 10;
     layout.majority          = 0;
-    uint64_t num_clients = 1;
-    uint64_t num_servers = 1;
-    uint64_t async_parallelism = 1; // THIS IS USED IF WE START TO BATCH IN THE FUTURES, OTHERWISE JUST SET TO 1
-    uint64_t num_registers = 100000;
-    uint64_t max_range = 10;
-    uint64_t majority = 0;       // 0 = auto-compute (num_servers/2 + 1)
 
     // Set by client at runtime after MR is allocated.
     // (Same pattern as swarm-kv: see Layout::client_local_region)
@@ -223,6 +217,11 @@ int main(int argc, char** argv) {
     if (layout.majority == 0) {
         layout.majority = layout.num_servers / 2 + 1;
     }
+
+    if(run_ml_workload){
+        layout.max_range = layout.num_registers; // Force max_range to cover the entire register space for the ML workload
+    }
+
 
     auto num_proc  = layout.num_clients + layout.num_servers;
     bool is_client = proc_id > layout.num_servers;

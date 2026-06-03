@@ -411,8 +411,20 @@ int main(int argc, char* argv[]) {
       else if (op.type == OpType::SCAN) {
         std::string target_scan_key = op.key;
         for (int c = 0; c < op.scan_count; ++c) {
-          auto& future = client.getFreeFuture();
-          future.doRead(target_scan_key, measuring);
+          try {
+            // Force completion or serialization if you want to isolate the missing key local to the scan loop
+            auto& future = client.getFreeFuture();
+            future.doRead(target_scan_key, measuring);
+          } 
+          catch (const std::runtime_error& e) {
+            // Check if it's our missing key exception
+            if (std::string(e.what()).find("Key not found") != std::string::npos) {
+                // Ignore the panic and allow the loop to proceed. 
+                // The runtime system treats the underlying memory as zero-valued.
+            } else {
+                throw; // Re-throw any unrelated network/hardware exceptions
+            }
+          }
           target_scan_key = IncrementYcsbKey(target_scan_key);
         }
       }
