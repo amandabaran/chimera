@@ -373,6 +373,8 @@ int main(int argc, char* argv[]) {
     std::chrono::steady_clock::time_point end;
     bool measuring = false;
     size_t skipped = 0;
+    uint64_t total_scan_duration_ns = 0;
+    uint64_t total_scans_measured = 0;
     // WORKLOAD LOOP - iterate through the list of operations and execute them on the KVS, while measuring latency and throughput
     // WORKLOAD LOOP
     for (size_t i = 0; i < total_iter_count; i++) {
@@ -410,25 +412,36 @@ int main(int argc, char* argv[]) {
       } 
       else if (op.type == OpType::SCAN) {
         std::string target_scan_key = op.key;
+        
+        // Capture start time of the macro scan operation if within measurement window
+        std::chrono::steady_clock::time_point scan_start;
+        if (measuring) {
+          scan_start = std::chrono::steady_clock::now();
+        }
+
         for (int c = 0; c < op.scan_count; ++c) {
           try {
-            // Force completion or serialization if you want to isolate the missing key local to the scan loop
             auto& future = client.getFreeFuture();
-            future.doRead(target_scan_key, measuring);
-            client.finishAllFutures(); // Ensure the read is fully processed before moving to the next key in the scan sequence
+            // Pass 'false' to disable internal fine-grained tracking for individual scan reads
+            future.doRead(target_scan_key, false); 
+            client.finishAllFutures(); 
           } 
           catch (const std::runtime_error& e) {
-            // Check if it's our missing key exception
             if (std::string(e.what()).find("Key not found") != std::string::npos) {
-                // Ignore the panic and allow the loop to proceed. 
-                // The runtime system treats the underlying memory as zero-valued.
+                // Ignore key missing states and proceed
             } else {
-                throw; // Re-throw any unrelated network/hardware exceptions
+                throw; 
             }
           }
           target_scan_key = IncrementYcsbKey(target_scan_key);
         }
-      }
+
+        // Calculate and add up the macro-operation duration
+        if (measuring) {
+          auto scan_end = std::chrono::steady_clock::now();
+          total_scan_duration_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(scan_end - scan_start).count();
+          total_scans_measured++;
+        }
     }
 
     client.finishAllFutures();
@@ -436,6 +449,13 @@ int main(int argc, char* argv[]) {
     std::cout << "Done. Results:" << std::endl;
     // WORKLOAD IS DONE, FINALIZE METRICS AND REPORT
     client.reportStats(detailed);
+    if (total_scans_measured > 0) {
+        double avg_scan_latency_ms = static_cast<double>(total_scan_duration_ns) / total_scans_measured / 1'000'000.0;
+        fmt::print("Macro Scan Count: {}\n", total_scans_measured);
+        fmt::print("Average Macro Scan Latency: {:.3f} ms\n", avg_scan_latency_ms);
+    } else {
+        fmt::print("Average Macro Scan Latency: N/A (No scan operations occurred during measurement window)\n");
+    }
     fmt::print(
         "Local tput: {}kpos\n",
         iter_count * 1'000'000 / static_cast<uint64_t>((end - start).count()));
