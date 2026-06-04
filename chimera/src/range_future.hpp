@@ -98,6 +98,9 @@ public:
                         if (max_reg < reg) max_reg = reg;
                     }
                     results_[off] = max_reg.fields.value;
+                    #if CHIMERA_CACHE_ENABLED
+                        state.cache.put(start_key + off, max_reg);
+                    #endif
                 }
                 if (measuring) {
                     state.addRangeMeasurement(start_time, std::chrono::steady_clock::now());

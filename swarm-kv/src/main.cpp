@@ -415,6 +415,7 @@ int main(int argc, char* argv[]) {
             // Force completion or serialization if you want to isolate the missing key local to the scan loop
             auto& future = client.getFreeFuture();
             future.doRead(target_scan_key, measuring);
+            client.finishAllFutures(); // Ensure the read is fully processed before moving to the next key in the scan sequence
           } 
           catch (const std::runtime_error& e) {
             // Check if it's our missing key exception
