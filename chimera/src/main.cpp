@@ -86,23 +86,24 @@ size_t pseudo_hash(const std::string& str) {
 
 void run_ml_prog_tracker_workload(
     chimera::ChimeraClient& client, 
-    uint64_t global_thread_id, // Derived entirely from proc_id mapping
-    uint64_t num_registers,
-    uint64_t ops_to_run) 
-{
-    chimera::RangeFuture range_future(client.getState(), 0);
+    uint64_t global_thread_id, 
+    uint64_t num_registers, // This equals total clients
+    uint64_t ops_to_run) {
 
     // --- WARMUP PHASE (5-second native spin) ---
     auto warmup_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
     while (std::chrono::steady_clock::now() < warmup_deadline) {
         if (global_thread_id == 0) {
-            range_future.doRange(0, num_registers - 1, false);
+            // Tracker sweeps the entire cluster's progress space: [0, num_registers - 1]
+            client.getFreeRangeFuture().doRange(0, num_registers - 1, false);
         } else {
-            client.getFreeFuture().doPut(global_thread_id % num_registers, 1, false);
+            // Workers warm up their own distinct register slot using its unique ID
+            client.getFreeFuture().doPut(global_thread_id, 1, false);
         }
         client.finishAllFutures();
     }
     
+    // Strict incremental state tracking for workers
     uint64_t progress_counter = 1;
     auto start_time = std::chrono::steady_clock::now();
 
@@ -111,33 +112,34 @@ void run_ml_prog_tracker_workload(
         bool measuring = (op_idx % 1000 == 0); 
 
         if (global_thread_id == 0) {
-            // Tracker role: Aggressively scans the register grid space
-            range_future.doRange(0, num_registers - 1, measuring);
+            // Tracker role: Aggressively scans every single client's designated register slot
+            client.getFreeRangeFuture().doRange(0, num_registers - 1, measuring);
         } else {
-            // Worker role: Regularly checkpoints progress to dedicated register spot
-            client.getFreeFuture().doPut(global_thread_id % num_registers, progress_counter++, measuring);
+            // Worker role: Zero contention. Client X always writes exclusively to Register X.
+            // Progress counter continuously increments the previous value.
+            client.getFreeFuture().doPut(global_thread_id, progress_counter++, measuring);
+            // Windowed flushing behavior keeps the hardware InfiniBand queues clean
+        }
+        if (op_idx % 16 == 0) {
+                client.finishAllFutures();
         }
         
-        // Windowed flushing behavior for pipelined asynchronous operations
-        if (op_idx % 16 == 0) {
-            client.finishAllFutures();
-        }
     }
     client.finishAllFutures();
     auto end_time = std::chrono::steady_clock::now();
 
-    // Results reporting formatted for easy parsing
+    // Results reporting
     uint64_t duration_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(end_time - start_time).count();
     double duration_sec = static_cast<double>(duration_ns) / 1'000'000'000.0;
     double tput_kops = (static_cast<double>(ops_to_run) / 1000.0) / duration_sec;
 
-    //switch to using cout
     std::cout << "ML-TRACKER-RESULTS: " 
               << "thread_id=" << global_thread_id << " "
               << "duration_sec=" << duration_sec << " "
               << "tput_kops=" << tput_kops 
               << std::endl;
 }
+
 int main(int argc, char** argv) {
     chimera::ProcId proc_id = 0;
     bool show_help = false;
@@ -218,9 +220,10 @@ int main(int argc, char** argv) {
         layout.majority = layout.num_servers / 2 + 1;
     }
 
-    if(run_ml_workload){
-        layout.max_range = layout.num_registers; // Force max_range to cover the entire register space for the ML workload
-    }
+    // if(run_ml_workload){
+    //     layout.num_registers = layout.num_clients;
+    //     layout.max_range = layout.num_registers; // Force max_range to cover the entire register space for the ML workload
+    // }
 
 
     auto num_proc  = layout.num_clients + layout.num_servers;
@@ -374,13 +377,13 @@ int main(int argc, char** argv) {
             // sequence. If this is client #1 (proc_id == num_servers + 1), it becomes ID 0 (Tracker).
             uint64_t global_thread_id = proc_id - layout.num_servers - 1;
 
-            std::cout << "Running single-threaded ML tracker workload. ID=" << global_thread_id << std::endl;
+            std::cout << "Running single-threaded ML tracker workload. ID=" << global_thread_id  << "Registers=" << layout.num_registers << "Clients=" << layout.num_clients << std::endl;
             
             // Sync with cluster deployment infrastructure
             ce.announceReady(store, "qp", "initialized");
             ce.waitReadyAll(store, "qp", "initialized");
 
-            run_ml_prog_tracker_workload(client, global_thread_id, layout.num_registers, iter_count);
+            run_ml_prog_tracker_workload(client, global_thread_id, layout.num_clients, iter_count);
 
             ce.announceReady(store, "qp", "finished");
             ce.waitReadyAll(store, "qp", "finished");
