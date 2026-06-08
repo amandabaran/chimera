@@ -84,24 +84,32 @@ public:
 
         switch (step) {
             case Reading: {
-                results_.clear();
-                results_.resize(range_len);
+                results_.assign(range_len, 0);
 
-                // For each key offset in the range, take the max register
-                // across the quorum, then extract its value.
-                for (size_t off = 0; off < range_len; ++off) {
-                    Register max_reg(0);
-                    for (size_t i = 0; i < state.quorum; ++i) {
-                        size_t r = state.quorum_indices[i];
-                        Register reg = bulk_bufs[r * state.layout.max_range + off];
-                        state.countRead();
-                        if (max_reg < reg) max_reg = reg;
+                const size_t stride = state.layout.max_range;
+
+                // Initialize running max from the first replica.
+                size_t r0 = state.quorum_indices[0];
+                Register* acc = bulk_bufs + r0 * stride;
+                state.countRead();  // one count per replica
+
+                // Merge remaining replicas into acc with a contiguous, vectorizable loop.
+                for (size_t i = 1; i < state.quorum; ++i) {
+                    size_t r = state.quorum_indices[i];
+                    const Register* src = bulk_bufs + r * stride;
+                    for (size_t off = 0; off < range_len; ++off) {
+                        if (acc[off] < src[off]) acc[off] = src[off];
                     }
-                    results_[off] = max_reg.fields.value;
+                }
+
+                // Extract values (and optionally update the cache).
+                for (size_t off = 0; off < range_len; ++off) {
+                    results_[off] = acc[off].fields.value;
                     #if CHIMERA_CACHE_ENABLED
-                        state.cache.put(start_key + off, max_reg);
+                        state.cache.put(start_key + off, acc[off]);
                     #endif
                 }
+
                 if (measuring) {
                     state.addRangeMeasurement(start_time, std::chrono::steady_clock::now());
                 }

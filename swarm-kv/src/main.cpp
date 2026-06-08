@@ -1,4 +1,9 @@
 #include <memory>
+#include <thread>
+#include <chrono>
+#include <iostream>
+#include <vector>
+#include <string>
 
 #include <lyra/lyra.hpp>
 
@@ -20,6 +25,13 @@ const uint64_t default_warmup = 1'000'000;
 const uint64_t default_iter_count = 1'000'000;
 const uint64_t default_keepwarm = 500'000;
 
+// Forward declaration to satisfy -Wmissing-declarations
+void run_ml_prog_tracker_workload(
+    OopsClient& client, 
+    uint64_t global_thread_id, 
+    uint64_t active_workers, 
+    uint64_t ops_to_run);
+
 inline std::string IncrementYcsbKey(const std::string& key) {
     size_t non_digit = key.find_first_of("0123456789");
     if (non_digit == std::string::npos) return key + "0"; 
@@ -35,6 +47,108 @@ inline std::string IncrementYcsbKey(const std::string& key) {
         return prefix + std::string(padding_needed, '0') + num_str;
     }
     return prefix + num_str;
+}
+
+void run_ml_prog_tracker_workload(
+    OopsClient& client, 
+    uint64_t global_thread_id, 
+    uint64_t active_workers, // Equal to layout.num_clients
+    uint64_t ops_to_run) 
+{
+    // Lambda to generate key strings
+    auto get_worker_key = [](uint64_t id) -> std::string {
+        std::string id_str = std::to_string(id);
+        return "worker_progress_" + std::string(8 - id_str.length(), '0') + id_str;
+    };
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // PRE-INSERTION PHASE
+    // ──────────────────────────────────────────────────────────────────────────
+    if (global_thread_id == 0) {
+        std::cout << "[ML-INIT] Pre-inserting tracking keys into Swarm-KV... " << std::flush;
+        
+        for (uint64_t w = 1; w <= active_workers; ++w) {
+            std::string k = get_worker_key(w);
+            std::string initial_val = "1";
+            std::string val_padded = initial_val + std::string(64 - initial_val.length(), '0');
+            
+            client.finishAllFutures();
+            client.getFreeFuture().doInsert(k, val_padded);
+        }
+        client.finishAllFutures();
+        std::cout << "Done. All keys initialized." << std::endl;
+    }
+
+    client.finishAllFutures(); 
+    std::this_thread::sleep_for(std::chrono::seconds(2)); 
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // --- WARMUP PHASE ---
+    // ──────────────────────────────────────────────────────────────────────────
+    auto warmup_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (std::chrono::steady_clock::now() < warmup_deadline) {
+        if (global_thread_id == 0) {
+            for (uint64_t w = 1; w <= active_workers; ++w) {
+                try {
+                    std::string k = get_worker_key(w);
+                    client.getFreeFuture().doRead(k, false);
+                } catch (...) {}
+            }
+            client.finishAllFutures(); 
+        } else {
+            std::string k = get_worker_key(global_thread_id);
+            std::string val_str = "1";
+            std::string val_padded = val_str + std::string(64 - val_str.length(), '0');
+            client.getFreeFuture().doUpdate(k, val_padded, false);
+            client.finishAllFutures();
+        }
+    }
+    
+    uint64_t progress_counter = 1;
+    auto start_time = std::chrono::steady_clock::now();
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // --- MAIN LOOP ---
+    // ──────────────────────────────────────────────────────────────────────────
+    for (uint64_t op_idx = 0; op_idx < ops_to_run; ++op_idx) {
+        bool measuring = (op_idx % 1000 == 0); 
+
+        if (global_thread_id == 0) {
+            for (uint64_t w = 1; w <= active_workers; ++w) {
+                try {
+                    std::string k = get_worker_key(w);
+                    client.getFreeFuture().doRead(k, measuring);
+                } 
+                catch (const std::runtime_error& e) {
+                    // Ignore key-not-found states safely
+                }
+            }
+            client.finishAllFutures();
+        } else {
+            std::string k = get_worker_key(global_thread_id);
+            std::string val_str = std::to_string(progress_counter++);
+            std::string val_padded = val_str + std::string(64 - val_str.length(), '0');
+            
+            client.getFreeFuture().doUpdate(k, val_padded, measuring);
+            
+            if (op_idx % 16 == 0) {
+                client.finishAllFutures();
+            }
+        }
+    }
+    client.finishAllFutures();
+    auto end_time = std::chrono::steady_clock::now();
+
+    uint64_t duration_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(end_time - start_time).count();
+    double duration_sec = static_cast<double>(duration_ns) / 1'000'000'000.0;
+    double tput_kops = (static_cast<double>(ops_to_run) / 1000.0) / duration_sec;
+
+    client.reportStats(true);
+    std::cout << "ML-TRACKER-RESULTS: " 
+              << "thread_id=" << global_thread_id << " "
+              << "duration_sec=" << duration_sec << " "
+              << "tput_kops=" << tput_kops 
+              << std::endl;
 }
 
 int main(int argc, char* argv[]) {
@@ -63,6 +177,8 @@ int main(int argc, char* argv[]) {
   size_t pointer_cache_size = UINT64_MAX;
   bool detailed = true;
 
+  bool run_ml_workload = false;
+
   std::string ycsb_path = "./YCSB/bin/ycsb.sh";
   std::string workload = "./YCSB/workloads/swarm-workloada";
 
@@ -84,8 +200,6 @@ int main(int argc, char* argv[]) {
           .optional()["-l"]["--logs"] |
       lyra::opt(layout.key_size, "key_size").optional()["-k"]["--keysize"] |
       lyra::opt(layout.value_size, "value_size").optional()["-v"]["--valuesize"] |
-      //  | lyra::opt(layout.logs_per_client, "logs_per_client")
-      //        .optional()["-l"]["--logsperclient"]
       lyra::opt(layout.bucket_bits, "bucket_bits")
             .optional()["-b"]["--bucketbits"] |
       lyra::opt(pointer_cache_size, "pointer_cache_size")
@@ -102,7 +216,8 @@ int main(int argc, char* argv[]) {
       lyra::opt(measure_batches, "measure_batches")
           .optional()["-B"]["--measure_batches"] |
       lyra::opt(iter_count, "iter_count").optional()["-I"]["--iter_count"] |
-      lyra::opt(warmup, "warmup").optional()["-W"]["--warmup"];
+      lyra::opt(warmup, "warmup").optional()["-W"]["--warmup"] |
+      lyra::opt(run_ml_workload, "ml").optional()["--ml"];
 
   auto result = cli.parse({argc, argv});
   if (!result) {
@@ -142,12 +257,10 @@ int main(int argc, char* argv[]) {
     return 1;
   }
   bool is_client = proc_id > layout.num_servers;
-  ProcId first_client = layout.num_servers + 1;
   if (is_client) {
     std::cout << "Workload: " << workload << std::endl;
     std::cout << "Log entry size: " << layout.fullLogEntrySize() << std::endl;
     std::cout << "KV entry size: " << layout.fullKVSize() << std::endl;
-    // pin_main_to_core(0);
   }
 
   std::vector<ProcId> remote_ids;
@@ -155,9 +268,6 @@ int main(int argc, char* argv[]) {
     if (id == proc_id) {
       continue;
     }
-    // if (is_client == (id > num_servers)) {
-    //   continue; // Only connect to clients if we are a server and vice versa
-    // }
     remote_ids.push_back(id);
   }
 
@@ -166,19 +276,14 @@ int main(int argc, char* argv[]) {
   ctrl::Devices d;
   ctrl::OpenDevice od;
 
-  // Get the last device
-  // od = std::move(d.list().back());
   auto& available_devices = d.list();
-  size_t target_index = 0; // This corresponds to the 3rd device (uverbs2 or mlx5_2)
+  size_t target_index = 0; 
 
   if (available_devices.size() > target_index) {
       od = std::move(available_devices[target_index]);
       std::cout << "Selected device: " << od.devName() << std::endl;
   } else {
       std::cerr << "Error: Device index " << target_index << " not available." << std::endl;
-      std::cerr << "Available devices: ";
-      for (auto const& dev : available_devices) std::cerr << dev.devName() << " ";
-      std::cerr << std::endl;
       return 1;
   }
 
@@ -195,13 +300,11 @@ int main(int argc, char* argv[]) {
             << +resolved_port.portId() << ", " << +resolved_port.portLid()
             << ")" << std::endl;
 
-  // 2. We configure the control block.
   ctrl::ControlBlock cb(resolved_port);
   cb.registerPd("primary");
 
   {
-    size_t allocated_size =
-        is_client ? layout.clientSize() : layout.serverSize();
+    size_t allocated_size = is_client ? layout.clientSize() : layout.serverSize();
     size_t alignment = 64;
     cb.allocateBuffer("shared-buf", allocated_size, alignment);
   }
@@ -222,7 +325,6 @@ int main(int argc, char* argv[]) {
     layout.client_local_region = local_region;
   }
 
-  // 3. We establish reliable connections.
   auto& store = memstore::MemoryStore::getInstance();
 
   RcConnectionExchanger<ProcId> ce(proc_id, remote_ids, cb);
@@ -235,7 +337,7 @@ int main(int argc, char* argv[]) {
   ce.announceReady(store, "qp", "prepared");
   ce.waitReadyAll(store, "qp", "prepared");
 
-  ce.unannounceReady(store, "qp", "finished");  // Clean up from previous runs
+  ce.unannounceReady(store, "qp", "finished"); 
 
   ce.connectAll(
       store, "qp",
@@ -246,31 +348,23 @@ int main(int argc, char* argv[]) {
   ce.announceReady(store, "qp", "connected");
   ce.waitReadyAll(store, "qp", "connected");
 
-  // Clean up
   ce.unannounceAll(store, "qp");
   ce.unannounceReady(store, "qp", "prepared");
 
   if (is_client) {
-    // CLIENT SETUP
-
-    // Owns the MRs, futures, latency stats
     OopsClient client{
         layout,          ce,          proc_id,   pointer_cache_size,
         measure_batches, death_point, iter_count};
 
-    // Workload Loader to insert keys into KVS froom YCSB workload file
     if (proc_id == layout.firstClientId()) {
-      std::cout << "Querying YCSB for the set of initial key-pairs... "
-                << std::flush;
+      std::cout << "Querying YCSB for the set of initial key-pairs... " << std::flush;
       std::vector<std::pair<std::string, std::string>> inserts = {};
 
       {
-        auto output =
-            exec(ycsb_path + " load basic -P " + workload + " -s 2> /dev/null");
+        auto output = exec(ycsb_path + " load basic -P " + workload + " -s 2> /dev/null");
         std::string line;
         while (std::getline(output, line)) {
-          if (std::strncmp("INSERT ", line.c_str(),
-                           std::string("INSERT ").length())) {
+          if (std::strncmp("INSERT ", line.c_str(), std::string("INSERT ").length())) {
             continue;
           }
           auto keystart = std::string("INSERT usertable ").length();
@@ -286,47 +380,35 @@ int main(int argc, char* argv[]) {
       }
       std::cout << "Done." << std::endl;
 
-      // Initialize the index
       std::cout << "Inserting the initial key-pairs... " << std::flush;
       for (size_t kvIndex = 0; kvIndex < inserts.size(); kvIndex++) {
         auto& insert = inserts[kvIndex];
-        auto& key = insert.first;
-        auto& value = insert.second;
-
         client.finishAllFutures();
-
-        client.getFuture(0).doInsert(key, value);
+        client.getFuture(0).doInsert(insert.first, insert.second);
       }
-
-      // Finish inserts
       client.finishAllFutures();
-
       std::cout << " Done." << std::endl;
     }
     
-    // All Clients parse YCSB run ouput into KV pairs and operations
-
     std::cout << "Querying YCSB for the list of operations... " << std::flush;
     enum class OpType { READ, UPDATE, SCAN };
 
     struct KvsOp {
       OpType type;
       std::string key;
-      std::string value; // Used for UPDATE
-      int scan_count;    // Used for SCAN
+      std::string value; 
+      int scan_count;    
     };
     std::vector<KvsOp> operations = {};
 
     {
-      auto output =
-          exec(ycsb_path + " run basic -P " + workload + " -s 2> /dev/null");
+      auto output = exec(ycsb_path + " run basic -P " + workload + " -s 2> /dev/null");
       std::string line;
       while (std::getline(output, line)) {
         if (!(std::strncmp("READ ", line.c_str(), std::string("READ ").length()))) {
           auto keystart = std::string("READ usertable ").length();
           auto keyend = line.find(" [", keystart);
           auto key = line.substr(keystart, keyend - keystart);
-
           operations.push_back({OpType::READ, key, "", 0});
         } else if (!(std::strncmp("UPDATE ", line.c_str(), std::string("UPDATE ").length()))) {
           auto keystart = std::string("UPDATE usertable ").length();
@@ -336,10 +418,8 @@ int main(int argc, char* argv[]) {
           auto start = keyend + std::string(" [ field0=").length();
           auto end = line.length() - std::string(" ]").length();
           auto value = line.substr(start, end - start);
-
           operations.push_back({OpType::UPDATE, key, value, 0});
         } else if (!(std::strncmp("SCAN ", line.c_str(), std::string("SCAN ").length()))) {
-          // Format: SCAN usertable userXXXXX count [ fields ]
           auto keystart = std::string("SCAN usertable ").length();
           auto keyend = line.find(" ", keystart);
           auto key = line.substr(keystart, keyend - keystart);
@@ -347,125 +427,133 @@ int main(int argc, char* argv[]) {
           auto countstart = keyend + 1;
           auto countend = line.find(" [", countstart);
           int count = std::stoi(line.substr(countstart, countend - countstart));
-
           operations.push_back({OpType::SCAN, key, "", count});
-        } else {
-          continue;
         }
       }
     }
-
     std::cout << "Done." << std::endl;
 
-    std::cout << "Waiting for the initialization of other clients... "
-              << std::flush;
-
+    std::cout << "Waiting for the initialization of other clients... " << std::flush;
     ce.announceReady(store, "qp", "initialized");
     ce.waitReadyAll(store, "qp", "initialized");
-
     std::cout << "Done." << std::endl;
-    // START WORKLOAD
-    std::cout << "Running the benchmark... " << std::endl;
 
+    std::cout << "Running the benchmark... " << std::endl;
     client.initClock();
 
-    std::chrono::steady_clock::time_point start;
-    std::chrono::steady_clock::time_point end;
-    bool measuring = false;
-    size_t skipped = 0;
-    uint64_t total_scan_duration_ns = 0;
-    uint64_t total_scans_measured = 0;
-    // WORKLOAD LOOP - iterate through the list of operations and execute them on the KVS, while measuring latency and throughput
-    // WORKLOAD LOOP
-    for (size_t i = 0; i < total_iter_count; i++) {
+    // ──────────────────────────────────────────────────────────────────────────
+    // BRANCH A: ML TRACKER WORKLOAD PATH
+    // ──────────────────────────────────────────────────────────────────────────
+    if (run_ml_workload) {
+        uint64_t global_thread_id = proc_id - layout.num_servers - 1;
 
-      retry_next_key:
-      auto& op = operations[(i + skipped) % operations.size()]; // Clean struct reference
+        std::cout << "Running single-threaded ML tracker workload. ID=" << global_thread_id  
+                  << " | Active Workers Checked=" << layout.num_clients << std::endl;
 
-      if (layout.async_parallelism > 1) {
-        auto hkey = hash(op.key); // Use op.key
-        for (size_t p = 0; p < layout.async_parallelism; p++) {
-          auto& future = client.getFuture(p);
-          if (future.hkey == hkey && !(future.isDone())) {
-            ++skipped;
-            goto retry_next_key;
-          }
-        }
-      }
+        run_ml_prog_tracker_workload(client, global_thread_id, layout.num_clients, iter_count);
 
-      if (i == start_measurements) {
-        measuring = true;
-        start = std::chrono::steady_clock::now();
-        client.startMeasurements(start);
-      } else if (i == stop_measurements) {
-        measuring = false;
-        end = std::chrono::steady_clock::now();
-      }
+        ce.announceReady(store, "qp", "finished");
+        ce.waitReadyAll(store, "qp", "finished");
+        ce.unannounceReady(store, "qp", "initialized");
+    } 
+    // ──────────────────────────────────────────────────────────────────────────
+    // BRANCH B: STANDARD YCSB WORKLOAD PATH
+    // ──────────────────────────────────────────────────────────────────────────
+    else {
+      std::chrono::steady_clock::time_point start;
+      std::chrono::steady_clock::time_point end;
+      bool measuring = false;
+      size_t skipped = 0;
+      uint64_t total_scan_duration_ns = 0;
+      uint64_t total_scans_measured = 0;
 
-      if (op.type == OpType::UPDATE) {
-        auto& future = client.getFreeFuture();
-        future.doUpdate(op.key, op.value, measuring);
-      } 
-      else if (op.type == OpType::READ) {
-        auto& future = client.getFreeFuture();
-        future.doRead(op.key, measuring);
-      } 
-      else if (op.type == OpType::SCAN) {
-        std::string target_scan_key = op.key;
-        
-        // Capture start time of the macro scan operation if within measurement window
-        std::chrono::steady_clock::time_point scan_start;
-        if (measuring) {
-          scan_start = std::chrono::steady_clock::now();
-        }
+      for (size_t i = 0; i < total_iter_count; i++) {
+        retry_next_key:
+        auto& op = operations[(i + skipped) % operations.size()]; 
 
-        for (int c = 0; c < op.scan_count; ++c) {
-          try {
-            auto& future = client.getFreeFuture();
-            // Pass 'false' to disable internal fine-grained tracking for individual scan reads
-            future.doRead(target_scan_key, false); 
-            client.finishAllFutures(); 
-          } 
-          catch (const std::runtime_error& e) {
-            if (std::string(e.what()).find("Key not found") != std::string::npos) {
-                // Ignore key missing states and proceed
-            } else {
-                throw; 
+        if (layout.async_parallelism > 1) {
+          auto hkey = hash(op.key); 
+          for (size_t p = 0; p < layout.async_parallelism; p++) {
+            auto& future = client.getFuture(p);
+            if (future.hkey == hkey && !(future.isDone())) {
+              ++skipped;
+              goto retry_next_key;
             }
           }
-          target_scan_key = IncrementYcsbKey(target_scan_key);
         }
 
-        // Calculate and add up the macro-operation duration
-        if (measuring) {
-          auto scan_end = std::chrono::steady_clock::now();
-          total_scan_duration_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(scan_end - scan_start).count();
-          total_scans_measured++;
+        if (i == start_measurements) {
+          measuring = true;
+          start = std::chrono::steady_clock::now();
+          client.startMeasurements(start);
+        } else if (i == stop_measurements) {
+          measuring = false;
+          end = std::chrono::steady_clock::now();
         }
+
+        if (op.type == OpType::UPDATE) {
+          auto& future = client.getFreeFuture();
+          future.doUpdate(op.key, op.value, measuring);
+        } 
+        else if (op.type == OpType::READ) {
+          auto& future = client.getFreeFuture();
+          future.doRead(op.key, measuring);
+        } 
+        else if (op.type == OpType::SCAN) {
+          std::string target_scan_key = op.key;
+          std::chrono::steady_clock::time_point scan_start;
+          if (measuring) {
+            scan_start = std::chrono::steady_clock::now();
+          }
+
+          for (int c = 0; c < op.scan_count; ++c) {
+            try {
+              auto& future = client.getFreeFuture();
+              future.doRead(target_scan_key, false); 
+              client.finishAllFutures(); 
+            } 
+            catch (const std::runtime_error& e) {
+              if (std::string(e.what()).find("Key not found") == std::string::npos) {
+                  throw; 
+              }
+            }
+            target_scan_key = IncrementYcsbKey(target_scan_key);
+          }
+
+          if (measuring) {
+            auto scan_end = std::chrono::steady_clock::now();
+            total_scan_duration_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(scan_end - scan_start).count();
+            total_scans_measured++;
+          }
+        }
+      }
+
+      client.finishAllFutures();
+
+      std::cout << "Done. Results:" << std::endl;
+      client.reportStats(detailed);
+
+      if (total_scans_measured > 0) {
+          double avg_scan_latency_ms = static_cast<double>(total_scan_duration_ns) 
+                                      / static_cast<double>(total_scans_measured) 
+                                      / 1'000'000.0;
+          fmt::print("Macro Scan Count: {}\n", total_scans_measured);
+          fmt::print("Average Macro Scan Latency: {:.3f} ms\n", avg_scan_latency_ms);
+      } else {
+          fmt::print("Average Macro Scan Latency: N/A (No scan operations occurred during measurement window)\n");
+      }
+
+      fmt::print(
+          "Local tput: {}kpos\n",
+          iter_count * 1'000'000 / static_cast<uint64_t>((end - start).count()));
+      fmt::print("Local duration: {}s\n", 
+          static_cast<uint64_t>((end - start).count() / 1000000000));
+      std::cout << std::flush;
+
+      ce.announceReady(store, "qp", "finished");
+      ce.waitReadyAll(store, "qp", "finished");
+      ce.unannounceReady(store, "qp", "initialized");
     }
-
-    client.finishAllFutures();
-
-    std::cout << "Done. Results:" << std::endl;
-    // WORKLOAD IS DONE, FINALIZE METRICS AND REPORT
-    client.reportStats(detailed);
-    if (total_scans_measured > 0) {
-        double avg_scan_latency_ms = static_cast<double>(total_scan_duration_ns) / total_scans_measured / 1'000'000.0;
-        fmt::print("Macro Scan Count: {}\n", total_scans_measured);
-        fmt::print("Average Macro Scan Latency: {:.3f} ms\n", avg_scan_latency_ms);
-    } else {
-        fmt::print("Average Macro Scan Latency: N/A (No scan operations occurred during measurement window)\n");
-    }
-    fmt::print(
-        "Local tput: {}kpos\n",
-        iter_count * 1'000'000 / static_cast<uint64_t>((end - start).count()));
-    fmt::print("Local duration: {}s\n", 
-        static_cast<uint64_t>((end - start).count() / 1000000000));
-    std::cout << std::flush;
-
-    ce.announceReady(store, "qp", "finished");
-    ce.waitReadyAll(store, "qp", "finished");
-    ce.unannounceReady(store, "qp", "initialized");
   } else {
     // SERVER/REPLICA SETUP
     std::vector<ProcId> client_ids;
@@ -481,9 +569,7 @@ int main(int argc, char* argv[]) {
     std::cout << "Closing server index connection." << std::endl;
   }
 
-  // 9. Clean up.
   ce.unannounceReady(store, "qp", "connected");
-
   std::cout << "###DONE###" << std::endl;
   return 0;
 }

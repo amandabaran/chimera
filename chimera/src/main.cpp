@@ -87,57 +87,103 @@ size_t pseudo_hash(const std::string& str) {
 void run_ml_prog_tracker_workload(
     chimera::ChimeraClient& client, 
     uint64_t global_thread_id, 
-    uint64_t num_registers, // This equals total clients
-    uint64_t ops_to_run) {
+    uint64_t num_clients,        // total client count (was num_registers)
+    uint64_t ops_to_run,
+    uint64_t think_time_ms,
+    dory::memstore::MemoryStore& store) {
+
+    std::cout << "Starting ML Tracker Workload: "
+              << "thread_id=" << global_thread_id
+              << " num_clients=" << num_clients
+              << " ops_to_run=" << ops_to_run
+              << " think_time_ms=" << think_time_ms << std::endl;
 
     // --- WARMUP PHASE (5-second native spin) ---
     auto warmup_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
     while (std::chrono::steady_clock::now() < warmup_deadline) {
         if (global_thread_id == 0) {
-            // Tracker sweeps the entire cluster's progress space: [0, num_registers - 1]
-            client.getFreeRangeFuture().doRange(0, num_registers - 1, false);
+            client.getFreeRangeFuture().doRange(0, num_clients - 1, false);
         } else {
-            // Workers warm up their own distinct register slot using its unique ID
             client.getFreeFuture().doPut(global_thread_id, 1, false);
         }
         client.finishAllFutures();
     }
-    
-    // Strict incremental state tracking for workers
-    uint64_t progress_counter = 1;
+
     auto start_time = std::chrono::steady_clock::now();
+    uint64_t completed_ops = 0;
 
-    // --- MAIN LOOP ---
-    for (uint64_t op_idx = 0; op_idx < ops_to_run; ++op_idx) {
-        bool measuring = (op_idx % 1000 == 0); 
+    if (global_thread_id == 0) {
+    // ────────────── TRACKER ──────────────
+        const uint64_t num_workers = num_clients - 1;
+        uint64_t workers_done = 0;
+        uint64_t op_idx = 0;
+        std::vector<bool> seen(num_clients, false);
 
-        if (global_thread_id == 0) {
-            // Tracker role: Aggressively scans every single client's designated register slot
-            client.getFreeRangeFuture().doRange(0, num_registers - 1, measuring);
-        } else {
-            // Worker role: Zero contention. Client X always writes exclusively to Register X.
-            // Progress counter continuously increments the previous value.
+        while (workers_done < num_workers) {
+            bool measuring = (op_idx % 1000 == 0);
+
+            // 1. Issue the range scan
+            client.getFreeRangeFuture().doRange(0, num_clients - 1, measuring);
+
+            // 2. Flush IMMEDIATELY so the measurement window closes
+            //    before we sleep. Latency stats now exclude think time.
+            client.finishAllFutures();
+
+            // 3. Poll worker-done flags (cheap, non-blocking memstore lookups).
+            //    Done here so it also doesn't pollute latency measurement.
+            if (op_idx % 16 == 0) {
+                for (uint64_t w = 1; w < num_clients; ++w) {
+                    if (seen[w]) continue;
+                    std::string val;
+                    if (store.get("ml_worker_done_" + std::to_string(w), val)) {
+                        seen[w] = true;
+                        ++workers_done;
+                        if (workers_done >= num_workers) break;
+                    }
+                }
+            }
+            if (workers_done >= num_workers) break;
+
+            // 4. NOW sleep — outside the measurement window.
+            if (think_time_ms > 0) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(think_time_ms));
+            }
+
+            ++op_idx;
+        }
+        completed_ops = op_idx;
+    } else {
+        // ────────────── WORKER ──────────────
+        uint64_t progress_counter = 1;
+
+        for (uint64_t op_idx = 0; op_idx < ops_to_run; ++op_idx) {
+            bool measuring = (op_idx % 1000 == 0);
             client.getFreeFuture().doPut(global_thread_id, progress_counter++, measuring);
-            // Windowed flushing behavior keeps the hardware InfiniBand queues clean
-        }
-        if (op_idx % 16 == 0) {
+            if (op_idx % 16 == 0) {
                 client.finishAllFutures();
+            }
         }
-        
+        client.finishAllFutures();
+        completed_ops = ops_to_run;
+
+        // Signal the tracker that this worker is done.
+        store.set("ml_worker_done_" + std::to_string(global_thread_id), "1");
     }
-    client.finishAllFutures();
+
     auto end_time = std::chrono::steady_clock::now();
 
-    // Results reporting
-    uint64_t duration_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(end_time - start_time).count();
+    uint64_t duration_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                               end_time - start_time).count();
     double duration_sec = static_cast<double>(duration_ns) / 1'000'000'000.0;
-    double tput_kops = (static_cast<double>(ops_to_run) / 1000.0) / duration_sec;
+    double tput_kops    = (static_cast<double>(completed_ops) / 1000.0) / duration_sec;
 
-    std::cout << "ML-TRACKER-RESULTS: " 
-              << "thread_id=" << global_thread_id << " "
-              << "duration_sec=" << duration_sec << " "
-              << "tput_kops=" << tput_kops 
-              << std::endl;
+    client.reportStats(true);
+    std::cout << "ML-TRACKER-RESULTS: "
+              << "thread_id=" << global_thread_id
+              << " role="     << (global_thread_id == 0 ? "tracker" : "worker")
+              << " ops="      << completed_ops
+              << " duration_sec=" << duration_sec
+              << " tput_kops=" << tput_kops << std::endl;
 }
 
 int main(int argc, char** argv) {
@@ -159,7 +205,9 @@ int main(int argc, char** argv) {
     float rq_p = 0.0f, get_p = 0.5f, put_p = 0.5f;
     uint64_t iter_count = default_iter_count;
     uint64_t warmup     = UINT64_MAX;
+
     bool run_ml_workload = false;
+    uint64_t think_time = 0;
 
     std::string ycsb_path = "./YCSB/bin/ycsb.sh";
     std::string workload = "./YCSB/workloads/swarm-workloada";
@@ -197,7 +245,8 @@ int main(int argc, char** argv) {
             ["--cache"]("Enable or disable the Chimera cache system (1 or 0)") |
         lyra::opt(chimera::writeback_enabled, "writeback")
             ["--writeback"]("Enable or disable writeback in CAS-ABD protocol (1 or 0)") |
-        lyra::opt(run_ml_workload, "ml").optional()["--ml"];
+        lyra::opt(run_ml_workload, "ml").optional()["--ml"] |
+        lyra::opt(think_time, "think").optional()["--think"];
 
     auto result = cli.parse({argc, argv});
     if (!result || show_help ) {
@@ -220,10 +269,9 @@ int main(int argc, char** argv) {
         layout.majority = layout.num_servers / 2 + 1;
     }
 
-    // if(run_ml_workload){
-    //     layout.num_registers = layout.num_clients;
-    //     layout.max_range = layout.num_registers; // Force max_range to cover the entire register space for the ML workload
-    // }
+    if(run_ml_workload){
+        layout.max_range = layout.num_clients; 
+    }
 
 
     auto num_proc  = layout.num_clients + layout.num_servers;
@@ -383,7 +431,9 @@ int main(int argc, char** argv) {
             ce.announceReady(store, "qp", "initialized");
             ce.waitReadyAll(store, "qp", "initialized");
 
-            run_ml_prog_tracker_workload(client, global_thread_id, layout.num_clients, iter_count);
+            run_ml_prog_tracker_workload(client, global_thread_id,
+                             layout.num_clients, iter_count,
+                             think_time, store);
 
             ce.announceReady(store, "qp", "finished");
             ce.waitReadyAll(store, "qp", "finished");
@@ -455,7 +505,6 @@ int main(int argc, char** argv) {
                     measuring = false;
                     end_time = std::chrono::steady_clock::now();
                 }
-
                 switch (op.type) {
                     case OpGet: {
                         client.getFreeFuture().doGet(op.target_reg, measuring);
@@ -477,6 +526,7 @@ int main(int argc, char** argv) {
                     default:
                         break;
                 }
+                client.finishAllFutures();
             }
 
             client.finishAllFutures();
